@@ -141,3 +141,22 @@ class Pi0TaVLAConfig(Pi0Config):
 
 
 
+
+@dataclasses.dataclass(frozen=True)
+class Pi0LatentFlowConfig(Pi0Config):
+
+    force_input_frames: int = 10
+    teacher_action_loss_weight: float = 1.0
+    student_action_loss_weight: float = 1.0
+    distill_layer_indices: tuple = (8,12,16)
+    future_force_align_loss_weight: float = 0.1
+    future_flow_align_loss_weight: float = 0.1
+    distill_projector_hidden_dim: int | None = None
+    flow_token_count: int = 16
+    flow_vae_name: str = "stabilityai/sdxl-vae"
+    flow_vae_latent_channels: int = 4
+    
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0":
+        from openpi.models.pi0_latent_flow import Pi0LatentFlow
+        return Pi0LatentFlow(self, rngs=nnx.Rngs(rng))

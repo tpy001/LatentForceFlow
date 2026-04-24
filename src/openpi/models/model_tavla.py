@@ -97,7 +97,9 @@ class Observation(Generic[ArrayT]):
     state: at.Float[ArrayT, "*b s"]
     # Effort(joint torque).
     effort: at.Float[ArrayT, "*b n e"] | None = None
-
+    # Optional flow image, in [-1, 1] float32.
+    flow_img: at.Float[ArrayT, "*b h w c"] | None = None
+    
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
     # Tokenized prompt mask.
@@ -124,11 +126,17 @@ class Observation(Generic[ArrayT]):
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        if "flow_img" in data:
+            if data["flow_img"].dtype == np.uint8:
+                data["flow_img"] = data["flow_img"].astype(np.float32) / 255.0 * 2.0 - 1.0
+            elif hasattr(data["flow_img"], "dtype") and data["flow_img"].dtype == torch.uint8:
+                data["flow_img"] = data["flow_img"].to(torch.float32) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
             effort=data.get("effort", None),
+            flow_img=data.get("flow_img"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -161,14 +169,21 @@ def preprocess_observation(
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
     """
-
-    if not set(image_keys).issubset(observation.images):
-        raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
+    available_image_keys = [key for key in image_keys if key in observation.images]
+    missing_image_keys = [key for key in image_keys if key not in observation.images]
+    if not available_image_keys:
+        raise ValueError(f"images dict missing keys: expected one of {image_keys}, got {list(observation.images)}")
+    if missing_image_keys:
+        logger.warning(
+            "Observation is missing image keys %s, using available keys %s instead.",
+            missing_image_keys,
+            available_image_keys,
+        )
 
     batch_shape = observation.state.shape[:-1]
 
     out_images = {}
-    for key in image_keys:
+    for key in available_image_keys:
         image = observation.images[key]
         if image.shape[1:3] != image_resolution:
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")

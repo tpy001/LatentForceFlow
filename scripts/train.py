@@ -136,10 +136,22 @@ def _load_weights_and_validate(loader, params_shape):
     return traverse_util.unflatten_dict(filtered)
 
 
+def _preload_model_assets(config: _config.TrainConfig) -> None:
+    flow_vae_name = getattr(config.model, "flow_vae_name", None)
+    if flow_vae_name is None:
+        return
+
+    from openpi.models.pi0_latent_flow import preload_flow_vae
+
+    logging.info("Preloading flow VAE '%s' before model initialization.", flow_vae_name)
+    preload_flow_vae(flow_vae_name)
+
+
 @at.typecheck
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
 ) -> tuple[training_utils.TrainState, Any]:
+    _preload_model_assets(config)
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
 
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
@@ -197,11 +209,17 @@ def train_step(
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
+    has_loss_stats = hasattr(model, "compute_loss_with_stats")
 
     @at.typecheck
     def loss_fn(
         model, rng, observation, actions
     ):
+        if has_loss_stats:
+            chunked_loss, loss_stats = model.compute_loss_with_stats(rng, observation, actions, train=True)
+            # Keep aux stats scalar-friendly for logging.
+            reduced_loss_stats = jax.tree.map(jnp.mean, loss_stats)
+            return jnp.mean(chunked_loss), reduced_loss_stats
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         return jnp.mean(chunked_loss)
 
@@ -210,7 +228,13 @@ def train_step(
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    if has_loss_stats:
+        (loss, loss_stats), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+            model, train_rng, observation, actions
+        )
+    else:
+        loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+        loss_stats = {}
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -243,7 +267,27 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    info.update(loss_stats)
     return new_state, info
+
+
+@at.typecheck
+def grad_stats_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch,
+) -> dict[str, at.Array]:
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+
+    train_rng = jax.random.fold_in(rng, state.step)
+    observation, actions = batch
+
+    if not hasattr(model, "compute_grad_stats"):
+        raise ValueError("Model does not implement compute_grad_stats")
+
+    return model.compute_grad_stats(train_rng, observation, actions, train=True)
 
 
 def main(config: _config.TrainConfig):
@@ -319,6 +363,17 @@ def main(config: _config.TrainConfig):
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+    model_for_stats = nnx.merge(train_state.model_def, train_state.params)
+    has_grad_stats = hasattr(model_for_stats, "compute_grad_stats")
+    del model_for_stats
+
+    pgrad_stats = None
+    if has_grad_stats:
+        pgrad_stats = jax.jit(
+            functools.partial(grad_stats_step, config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=replicated_sharding,
+        )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -336,7 +391,18 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            if pgrad_stats is not None:
+                grad_stats = pgrad_stats(train_rng, train_state, batch)
+                grad_stats = jax.device_get(jax.tree.map(jnp.mean, grad_stats))
+                reduced_info.update(grad_stats)
+
+            def _fmt_val(v):
+                try:
+                    return f"{float(v):.8f}"
+                except (TypeError, ValueError):
+                    return str(v)
+
+            info_str = ", ".join(f"{k}={_fmt_val(v)}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []

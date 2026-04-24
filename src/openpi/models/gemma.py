@@ -27,14 +27,12 @@ We follow this einsum axis naming convention:
 
 from collections.abc import Sequence
 import dataclasses
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import einops
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-from typing import Any, Literal, TypeAlias
-
 
 import openpi.models.lora as lora
 import openpi.shared.array_typing as at
@@ -221,9 +219,22 @@ class Attention(nn.Module):
         assert q.dtype == k.dtype == v.dtype == dtype
 
         if kv_cache is not None:
-            cache_k, cache_v = kv_cache
-            k = jnp.concatenate([cache_k, k], axis=1)
-            v = jnp.concatenate([cache_v, v], axis=1)
+            if len(kv_cache) == 2:
+                cache_k, cache_v = kv_cache
+                k = jnp.concatenate([cache_k, k], axis=1)
+                v = jnp.concatenate([cache_v, v], axis=1)
+                kv_cache = (k, v)
+            elif len(kv_cache) == 3:
+                idx, cache_k, cache_v = kv_cache
+                update_len = k.shape[1]
+                indices = (0, idx[0], 0, 0)
+                k = jax.lax.dynamic_update_slice(cache_k, k.astype(cache_k.dtype), indices)
+                v = jax.lax.dynamic_update_slice(cache_v, v.astype(cache_v.dtype), indices)
+                kv_cache = (idx + update_len, k, v)
+            else:
+                raise ValueError(f"Unsupported KV cache format with {len(kv_cache)} entries.")
+        else:
+            kv_cache = (k, v)
 
         q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
         logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
@@ -258,7 +269,7 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
-        return out, (k, v)
+        return out, kv_cache
 
 
 @at.typecheck
@@ -342,10 +353,16 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache
+        return xs, (kv_cache, xs)
 
 
-KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
+ConcatKVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
+IncrementalKVCache: TypeAlias = tuple[
+    at.Int[at.Array, "l b"],
+    at.Float[at.Array, "l b _t _k _h"],
+    at.Float[at.Array, "l b _t _v _h"],
+]
+KVCache: TypeAlias = ConcatKVCache | IncrementalKVCache
 
 
 @at.typecheck

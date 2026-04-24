@@ -343,6 +343,74 @@ class LeRobotTaVLADataConfig(DataConfigFactory):
             rcs_sample_enable = self.rcs_sample_enable
         )
 
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotOptimalFlowDataConfig(DataConfigFactory):
+    """
+    Data config for the custom Yuanluo dataset.
+    """
+    max_episodes: int | None = None  # None = 用全部
+    rcs_sample_enable: bool = False
+    use_delta_joint_actions: bool = True # 是否使用相对于当前frame 的action
+    delta_action_mask_size: int = 6
+    delta_action_mask_offset: int = -1
+
+    default_prompt: str | None = None
+    padding_stat: bool = False
+    # Actions are absolute values, so no extra delta transform is needed.
+    extra_delta_transform: bool = False
+    effort_history: Sequence[int] = ()
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default=_transforms.Group())
+    action_sequence_keys: Sequence[str] = ("action",)
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.head_camera": "observation.images.head_camera",
+                        "observation.images.wrist_left_camera": "observation.images.wrist_left_camera",
+                        "observation.images.future_flow": "observation.future_flow.base_0_rgb",
+                        "observation.state": "observation.state",
+                        "observation.effort": "observation.effort",
+                        "observation.is_contact": "observation.is_contact",
+                        "action": "action",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[yuanluo_policy.YuanluoTaVLAInputs(model_type=model_config.model_type)], # here is the difference to parent class
+            outputs=[yuanluo_policy.YuanluoTaVLAOutputs()],
+        )
+
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(self.delta_action_mask_size, self.delta_action_mask_offset)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        if self.default_prompt and isinstance(self.repo_id, list):
+            raise ValueError("Using default prompt when using multiple dataset is incorrect.")
+        
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+            effort_history=self.effort_history,
+            prompt_from_task=(self.default_prompt is None),
+            max_episodes = self.max_episodes,
+            rcs_sample_enable = self.rcs_sample_enable
+        )
+
     
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -482,6 +550,34 @@ _CONFIGS = [
         save_interval=15000,
         keep_period=15000,
         # ema_decay = None # 节省显存
+    ),
+    TrainConfig(
+        name="pi0_latent_flow",
+        model=pi0_config.Pi0LatentFlowConfig(
+            action_horizon=32,
+            effort_type=EffortType.MOT,
+            effort_dim=6,  # 6-axis force sensor
+            # new parms
+            force_input_frames=10,
+            distill_layer_indices=(8, 12, 16),
+            future_force_align_loss_weight=0.5,
+            future_flow_align_loss_weight=0.5,
+        ),
+        data=LeRobotOptimalFlowDataConfig(
+            repo_id="llly/all_0409_stage_flow", # Placeholder, replace with your actual repo_id
+            effort_history=tuple(list((4 * i - 36 for i in range(10))) + list(range(1, 33))),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=False, # Yuanluo actions are absolute
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi0_base/params"),
+        num_train_steps=30_000, # Default to 30k steps, adjust as needed
+        # num_workers=8,
+        batch_size=16,
+        save_interval=15000,
+        keep_period=15000,
+        ema_decay = None # 节省显存
     ),
 ]
 

@@ -57,7 +57,7 @@ class YuanluoInputs(transforms.DataTransformFn):
                 "left_wrist_0_rgb": left_wrist_camera_image,
                 # Pad any non-existent images with zero-arrays of the appropriate shape.
                 # "right_wrist_0_rgb": gelsight_left_image, #np.zeros_like(left_wrist_camera_image),
-                "right_wrist_0_rgb": np.zeros_like(left_wrist_camera_image), # without Gelsight
+                # "right_wrist_0_rgb": np.zeros_like(left_wrist_camera_image), # without Gelsight
                 # "right_wrist_0_rgb": gelsight_left_image, # with gelsight
                 # "gelsight_left_rgb": gelsight_left_image,
                 # "gelsight_right_rgb": gelsight_right_image,
@@ -66,11 +66,13 @@ class YuanluoInputs(transforms.DataTransformFn):
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
                 # We only mask padding images for pi0 model, not pi0-FAST. Do not change this for your own dataset.
-                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_, # without gelsight
+                # "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_, # without gelsight
                 # "right_wrist_0_rgb": np.True_, # # with gelsight
                 # "gelsight_right_rgb": np.True_,
             },
         }
+        if "observation.images.future_flow" in data:
+            inputs["flow_img"] = _parse_image(data["observation.images.future_flow"])
 
         # Pad actions to the model action dimension. Actions are only available during training.
         if "action" in data:
