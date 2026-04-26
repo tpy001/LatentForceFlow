@@ -13,6 +13,7 @@ import torch
 
 # import openpi.models.model as _model
 import openpi.models.model_tavla as _model
+import openpi.models.pi0_config as pi0_config
 import openpi.training.config as _config
 import openpi.transforms as _transforms
 from openpi.shared.effort_type import EffortType
@@ -219,6 +220,15 @@ def create_torch_dataset(
     if model_config.effort_type in (EffortType.EXPERT_FUT, EffortType.EXPERT_HIS_C_FUT, EffortType.EXPERT_HIS_C_L_FUT):
           # 如果需要预测未来的 effort 的话，就需要多往后读取 action_horizon 个 effort，因此此时 effort 的区间：[-effort_history, +action_horizon]
           delta_timestamps["observation.effort"] += [(t + 1) / dataset_meta.fps for t in range(model_config.action_horizon)]
+
+    if (
+        isinstance(model_config, pi0_config.Pi0LatentFlowConfig)
+        and model_config.use_future_rgb_instead_of_flow
+    ):
+        delta_timestamps["observation.images.head_camera"] = [
+            0.0,
+            model_config.future_rgb_step / dataset_meta.fps,
+        ]
 
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,

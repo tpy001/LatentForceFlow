@@ -99,6 +99,8 @@ class Observation(Generic[ArrayT]):
     effort: at.Float[ArrayT, "*b n e"] | None = None
     # Optional flow image, in [-1, 1] float32.
     flow_img: at.Float[ArrayT, "*b h w c"] | None = None
+    # Optional future RGB image aligned with a selected action step.
+    future_rgb_img: at.Float[ArrayT, "*b h w c"] | None = None
     
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -131,12 +133,18 @@ class Observation(Generic[ArrayT]):
                 data["flow_img"] = data["flow_img"].astype(np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["flow_img"], "dtype") and data["flow_img"].dtype == torch.uint8:
                 data["flow_img"] = data["flow_img"].to(torch.float32) / 255.0 * 2.0 - 1.0
+        if "future_rgb_img" in data:
+            if data["future_rgb_img"].dtype == np.uint8:
+                data["future_rgb_img"] = data["future_rgb_img"].astype(np.float32) / 255.0 * 2.0 - 1.0
+            elif hasattr(data["future_rgb_img"], "dtype") and data["future_rgb_img"].dtype == torch.uint8:
+                data["future_rgb_img"] = data["future_rgb_img"].to(torch.float32) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
             effort=data.get("effort", None),
             flow_img=data.get("flow_img"),
+            future_rgb_img=data.get("future_rgb_img"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),

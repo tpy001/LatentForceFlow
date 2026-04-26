@@ -66,6 +66,8 @@ class Pi0LatentFlow(_model.BaseModel):
         self.flow_token_count = int(config.flow_token_count)
         self.future_flow_channels = 3
         self.flow_vae_name = getattr(config, "flow_vae_name", "stabilityai/sdxl-vae")
+        self.use_future_rgb_instead_of_flow = bool(config.use_future_rgb_instead_of_flow)
+        self.future_rgb_step = int(config.future_rgb_step)
         self._debug_lengths_logged = False
 
 
@@ -340,23 +342,45 @@ class Pi0LatentFlow(_model.BaseModel):
         )
 
     @staticmethod
-    def _restore_flow_img(processed: _model.Observation, original_flow_img: at.Array | None) -> _model.Observation:
-        if original_flow_img is None:
+    def _restore_aux_images(
+        processed: _model.Observation,
+        original_flow_img: at.Array | None,
+        original_future_rgb_img: at.Array | None,
+    ) -> _model.Observation:
+        updates = {}
+        if original_flow_img is not None:
+            updates["flow_img"] = original_flow_img
+        if original_future_rgb_img is not None:
+            updates["future_rgb_img"] = original_future_rgb_img
+        if not updates:
             return processed
-        return processed.replace(flow_img=original_flow_img)
+        return processed.replace(**updates)
 
     def _require_flow_img(self, obs: _model.Observation) -> at.Array:
         if obs.flow_img is None:
             raise ValueError("Pi0LatentFlow requires `observation.flow_img` for flow distillation.")
         return obs.flow_img
 
-    def _encode_flow_image(self, flow: at.Float[at.Array, "b h w c"]) -> at.Float[at.Array, "b s d"]:
-        x = jnp.asarray(flow, dtype=jnp.float32)
+    def _require_future_rgb_img(self, obs: _model.Observation) -> at.Array:
+        if obs.future_rgb_img is None:
+            raise ValueError(
+                "Pi0LatentFlow requires `observation.future_rgb_img` for RGB ablation "
+                "when `use_future_rgb_instead_of_flow=True`."
+            )
+        return obs.future_rgb_img
+
+    def _get_future_visual_image(self, obs: _model.Observation) -> at.Array:
+        if self.use_future_rgb_instead_of_flow:
+            return self._require_future_rgb_img(obs)
+        return self._require_flow_img(obs)
+
+    def _encode_future_visual_image(self, image: at.Float[at.Array, "b h w c"]) -> at.Float[at.Array, "b s d"]:
+        x = jnp.asarray(image, dtype=jnp.float32)
         if x.ndim != 4:
-            raise ValueError(f"Expected flow_img with shape [B, H, W, C], got {x.shape}.")
+            raise ValueError(f"Expected future visual image with shape [B, H, W, C], got {x.shape}.")
         if x.shape[-1] != self.future_flow_channels:
             raise ValueError(
-                f"Expected flow_img with {self.future_flow_channels} channels, got shape={x.shape}."
+                f"Expected future visual image with {self.future_flow_channels} channels, got shape={x.shape}."
             )
         # FlaxAutoencoderKL.encode expects BCHW input and internally converts to NHWC.
         x = jnp.transpose(x, (0, 3, 1, 2))
@@ -389,7 +413,7 @@ class Pi0LatentFlow(_model.BaseModel):
         return jnp.einsum("bqk,bkd->bqd", attn, values)
 
     def _compress_future_flows(self, obs: _model.Observation) -> at.Float[at.Array, "b n d"]:
-        return self._encode_flow_image(self._require_flow_img(obs))
+        return self._encode_future_visual_image(self._get_future_visual_image(obs))
 
     @at.typecheck
     def embed_student_suffix(
@@ -527,10 +551,11 @@ class Pi0LatentFlow(_model.BaseModel):
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         original_flow_img = observation.flow_img
+        original_future_rgb_img = observation.future_rgb_img
         observation = _model.preprocess_observation(
             preprocess_rng, observation, train=train, effort_type=self.effort_type
         )
-        observation = self._restore_flow_img(observation, original_flow_img)
+        observation = self._restore_aux_images(observation, original_flow_img, original_future_rgb_img)
         history_effort, future_effort = self._split_effort(observation, require_future=True, dtype=actions.dtype)
         if future_effort is None:
             raise ValueError("Pi0MORDualAlignForceFlow teacher training requires future effort.")
@@ -614,8 +639,9 @@ class Pi0LatentFlow(_model.BaseModel):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
         original_flow_img = observation.flow_img
+        original_future_rgb_img = observation.future_rgb_img
         observation = _model.preprocess_observation(None, observation, train=False, effort_type=self.effort_type)
-        observation = self._restore_flow_img(observation, original_flow_img)
+        observation = self._restore_aux_images(observation, original_flow_img, original_future_rgb_img)
         history_effort, _ = self._split_effort(observation, require_future=False, dtype=jnp.float32)
 
         dt = -1.0 / num_steps

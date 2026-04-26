@@ -144,7 +144,6 @@ class Pi0TaVLAConfig(Pi0Config):
 
 @dataclasses.dataclass(frozen=True)
 class Pi0LatentFlowConfig(Pi0Config):
-
     force_input_frames: int = 10
     teacher_action_loss_weight: float = 1.0
     student_action_loss_weight: float = 1.0
@@ -155,6 +154,17 @@ class Pi0LatentFlowConfig(Pi0Config):
     flow_token_count: int = 16
     flow_vae_name: str = "stabilityai/sdxl-vae"
     flow_vae_latent_channels: int = 4
+    use_future_rgb_instead_of_flow: bool = False
+    future_rgb_step: int = 0
+
+    @override
+    def __post_init__(self):
+        super().__post_init__()
+        if not 0 <= self.future_rgb_step <= self.action_horizon:
+            raise ValueError(
+                f"future_rgb_step must satisfy 0 <= future_rgb_step <= action_horizon={self.action_horizon}, "
+                f"got {self.future_rgb_step}."
+            )
     
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0":

@@ -104,9 +104,49 @@ class YuanluoOutputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class YuanluoTaVLAInputs(YuanluoInputs):
+    use_future_rgb_instead_of_flow: bool = False
+
+    def _split_head_camera(
+        self,
+        head_camera,
+        *,
+        require_future_frame: bool,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        head_camera = np.asarray(head_camera)
+        if not self.use_future_rgb_instead_of_flow:
+            return _parse_image(head_camera), None
+
+        if head_camera.ndim < 4:
+            if require_future_frame:
+                raise ValueError(
+                    "YuanluoTaVLAInputs expected `observation.images.head_camera` to contain "
+                    "current and future frames when `use_future_rgb_instead_of_flow=True`."
+                )
+            return _parse_image(head_camera), None
+
+        if head_camera.shape[0] < 2:
+            if require_future_frame:
+                raise ValueError(
+                    "YuanluoTaVLAInputs expected `observation.images.head_camera` to contain "
+                    "current and future frames when `use_future_rgb_instead_of_flow=True`."
+                )
+            return _parse_image(head_camera[0]), None
+
+        current_frame = _parse_image(head_camera[0])
+        future_frame = _parse_image(head_camera[1])
+        return current_frame, future_frame
+
     def __call__(self, data: dict) -> dict:
+        current_head_camera, future_rgb_img = self._split_head_camera(
+            data["observation.images.head_camera"],
+            require_future_frame="action" in data,
+        )
+        data = dict(data)
+        data["observation.images.head_camera"] = current_head_camera
         inputs = super().__call__(data)
         inputs["effort"] = data["observation.effort"] # Append 6-axis force sensor data 
+        if future_rgb_img is not None:
+            inputs["future_rgb_img"] = future_rgb_img
         
         # Optionally pass through contact-related supervision signals if present
         if "observation.is_contact" in data:

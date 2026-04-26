@@ -315,7 +315,12 @@ class LeRobotTaVLADataConfig(DataConfigFactory):
         )
 
         data_transforms = _transforms.Group(
-            inputs=[yuanluo_policy.YuanluoTaVLAInputs(model_type=model_config.model_type)], # here is the difference to parent class
+            inputs=[
+                yuanluo_policy.YuanluoTaVLAInputs(
+                    model_type=model_config.model_type,
+                    use_future_rgb_instead_of_flow=getattr(model_config, "use_future_rgb_instead_of_flow", False),
+                )
+            ], # here is the difference to parent class
             outputs=[yuanluo_policy.YuanluoTaVLAOutputs()],
         )
 
@@ -383,7 +388,12 @@ class LeRobotOptimalFlowDataConfig(DataConfigFactory):
         )
 
         data_transforms = _transforms.Group(
-            inputs=[yuanluo_policy.YuanluoTaVLAInputs(model_type=model_config.model_type)], # here is the difference to parent class
+            inputs=[
+                yuanluo_policy.YuanluoTaVLAInputs(
+                    model_type=model_config.model_type,
+                    use_future_rgb_instead_of_flow=getattr(model_config, "use_future_rgb_instead_of_flow", False),
+                )
+            ], # here is the difference to parent class
             outputs=[yuanluo_policy.YuanluoTaVLAOutputs()],
         )
 
@@ -562,6 +572,35 @@ _CONFIGS = [
             distill_layer_indices=(8, 12, 16),
             future_force_align_loss_weight=0.5,
             future_flow_align_loss_weight=0.5,
+        ),
+        data=LeRobotOptimalFlowDataConfig(
+            repo_id="llly/all_0409_stage_flow", # Placeholder, replace with your actual repo_id
+            effort_history=tuple(list((4 * i - 36 for i in range(10))) + list(range(1, 33))),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=False, # Yuanluo actions are absolute
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi0_base/params"),
+        num_train_steps=30_000, # Default to 30k steps, adjust as needed
+        # num_workers=8,
+        batch_size=16,
+        save_interval=15000,
+        keep_period=15000,
+        ema_decay = None # 节省显存
+    ),
+    TrainConfig(
+        name="pi0_latent_future_rgb",
+        model=pi0_config.Pi0LatentFlowConfig(
+            action_horizon=32,
+            effort_type=EffortType.MOT,
+            effort_dim=6,  # 6-axis force sensor
+            force_input_frames=10,
+            distill_layer_indices=(8, 12, 16),
+            future_force_align_loss_weight=0.5,
+            future_flow_align_loss_weight=0.5,
+            use_future_rgb_instead_of_flow=True,
+            future_rgb_step=32,
         ),
         data=LeRobotOptimalFlowDataConfig(
             repo_id="llly/all_0409_stage_flow", # Placeholder, replace with your actual repo_id
