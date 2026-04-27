@@ -1,5 +1,5 @@
 import abc
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import dataclasses
 import enum
 import logging
@@ -22,6 +22,16 @@ from openpi.shared.effort_type import EffortType
 import openpi.shared.array_typing as at
 
 logger = logging.getLogger("openpi")
+
+
+def _merge_params_with_defaults(defaults: at.Params, loaded: at.Params) -> at.Params:
+    """Fills missing leaves in loaded params with the current model initialization."""
+    if isinstance(defaults, dict) and isinstance(loaded, Mapping):
+        return {
+            key: _merge_params_with_defaults(default_value, loaded[key]) if key in loaded else default_value
+            for key, default_value in defaults.items()
+        }
+    return loaded
 
 # Type variable for array types (JAX arrays, PyTorch tensors, or numpy arrays)
 ArrayT = TypeVar("ArrayT", bound=jax.Array | torch.Tensor | np.ndarray)
@@ -99,8 +109,12 @@ class Observation(Generic[ArrayT]):
     effort: at.Float[ArrayT, "*b n e"] | None = None
     # Optional flow image, in [-1, 1] float32.
     flow_img: at.Float[ArrayT, "*b h w c"] | None = None
+    # Optional wrist flow image, in [-1, 1] float32.
+    wrist_flow_img: at.Float[ArrayT, "*b h w c"] | None = None
     # Optional future RGB image aligned with a selected action step.
     future_rgb_img: at.Float[ArrayT, "*b h w c"] | None = None
+    # Optional future wrist RGB image aligned with a selected action step.
+    future_wrist_rgb_img: at.Float[ArrayT, "*b h w c"] | None = None
     
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -128,23 +142,21 @@ class Observation(Generic[ArrayT]):
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
-        if "flow_img" in data:
-            if data["flow_img"].dtype == np.uint8:
-                data["flow_img"] = data["flow_img"].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["flow_img"], "dtype") and data["flow_img"].dtype == torch.uint8:
-                data["flow_img"] = data["flow_img"].to(torch.float32) / 255.0 * 2.0 - 1.0
-        if "future_rgb_img" in data:
-            if data["future_rgb_img"].dtype == np.uint8:
-                data["future_rgb_img"] = data["future_rgb_img"].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["future_rgb_img"], "dtype") and data["future_rgb_img"].dtype == torch.uint8:
-                data["future_rgb_img"] = data["future_rgb_img"].to(torch.float32) / 255.0 * 2.0 - 1.0
+        for aux_image_key in ("flow_img", "wrist_flow_img", "future_rgb_img", "future_wrist_rgb_img"):
+            if aux_image_key in data:
+                if data[aux_image_key].dtype == np.uint8:
+                    data[aux_image_key] = data[aux_image_key].astype(np.float32) / 255.0 * 2.0 - 1.0
+                elif hasattr(data[aux_image_key], "dtype") and data[aux_image_key].dtype == torch.uint8:
+                    data[aux_image_key] = data[aux_image_key].to(torch.float32) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
             effort=data.get("effort", None),
             flow_img=data.get("flow_img"),
+            wrist_flow_img=data.get("wrist_flow_img"),
             future_rgb_img=data.get("future_rgb_img"),
+            future_wrist_rgb_img=data.get("future_wrist_rgb_img"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -246,6 +258,10 @@ def preprocess_observation(
         image_masks=out_masks,
         state=state,
         effort=effort,
+        flow_img=observation.flow_img,
+        wrist_flow_img=observation.wrist_flow_img,
+        future_rgb_img=observation.future_rgb_img,
+        future_wrist_rgb_img=observation.future_wrist_rgb_img,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
@@ -280,9 +296,11 @@ class BaseModelConfig(abc.ABC):
         """Create a model with the given parameters."""
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
+        expected_params = state.to_pure_dict()
         if remove_extra_params:
-            params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
-        at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
+            params = ocp.transform_utils.intersect_trees(expected_params, params)
+        params = _merge_params_with_defaults(expected_params, params)
+        at.check_pytree_equality(expected=expected_params, got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
 

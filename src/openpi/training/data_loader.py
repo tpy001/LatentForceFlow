@@ -229,6 +229,10 @@ def create_torch_dataset(
             0.0,
             model_config.future_rgb_step / dataset_meta.fps,
         ]
+        delta_timestamps["observation.images.wrist_left_camera"] = [
+            0.0,
+            model_config.future_rgb_step / dataset_meta.fps,
+        ]
 
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,

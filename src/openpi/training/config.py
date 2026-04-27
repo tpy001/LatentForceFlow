@@ -377,6 +377,7 @@ class LeRobotOptimalFlowDataConfig(DataConfigFactory):
                         "observation.images.head_camera": "observation.images.head_camera",
                         "observation.images.wrist_left_camera": "observation.images.wrist_left_camera",
                         "observation.images.future_flow": "observation.future_flow.base_0_rgb",
+                        "observation.images.future_wrist_flow": "observation.future_flow.left_wrist_0_rgb",
                         "observation.state": "observation.state",
                         "observation.effort": "observation.effort",
                         "observation.is_contact": "observation.is_contact",
@@ -582,6 +583,70 @@ _CONFIGS = [
             extra_delta_transform=False, # Yuanluo actions are absolute
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi0_base/params"),
+        num_train_steps=30_000, # Default to 30k steps, adjust as needed
+        # num_workers=8,
+        batch_size=16,
+        save_interval=15000,
+        keep_period=15000,
+        ema_decay = None # 节省显存
+    ),
+    TrainConfig(
+        name="pi0_latent_flow_multiview",
+        model=pi0_config.Pi0LatentFlowConfig(
+            action_horizon=32,
+            effort_type=EffortType.MOT,
+            effort_dim=6,  # 6-axis force sensor
+            force_input_frames=10,
+            distill_layer_indices=(8, 12, 16),
+            future_force_align_loss_weight=0.5,
+            future_flow_align_loss_weight=0.5,
+            use_future_rgb_instead_of_flow = False
+        ),
+        data=LeRobotOptimalFlowDataConfig(
+            # This multiview config expects both
+            # `observation.future_flow.base_0_rgb` and
+            # `observation.future_flow.left_wrist_0_rgb` in the dataset.
+            repo_id="llly/all_0409_stage_flow", # Placeholder, replace with your actual repo_id
+            effort_history=tuple(list((4 * i - 36 for i in range(10))) + list(range(1, 33))),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=False, # Yuanluo actions are absolute
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi0_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi0_latent_flow_multiview/pi0_latent_flow_multiview/29999/params"),
+        num_train_steps=30_000, # Default to 30k steps, adjust as needed
+        # num_workers=8,
+        batch_size=16,
+        save_interval=15000,
+        keep_period=15000,
+        ema_decay = None # 节省显存
+    ),
+    TrainConfig(
+        name="pi0_latent_rgb_multiview",
+        model=pi0_config.Pi0LatentFlowConfig(
+            action_horizon=32,
+            effort_type=EffortType.MOT,
+            effort_dim=6,  # 6-axis force sensor
+            force_input_frames=10,
+            distill_layer_indices=(8, 12, 16),
+            future_force_align_loss_weight=0.5,
+            future_flow_align_loss_weight=0.5,
+            use_future_rgb_instead_of_flow = True
+        ),
+        data=LeRobotOptimalFlowDataConfig(
+            # This multiview config expects both
+            # `observation.future_flow.base_0_rgb` and
+            # `observation.future_flow.left_wrist_0_rgb` in the dataset.
+            repo_id="llly/all_0409_stage_flow", # Placeholder, replace with your actual repo_id
+            effort_history=tuple(list((4 * i - 36 for i in range(10))) + list(range(1, 33))),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=False, # Yuanluo actions are absolute
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi0_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi0_latent_flow_multiview/pi0_latent_flow_multiview/29999/params"),
         num_train_steps=30_000, # Default to 30k steps, adjust as needed
         # num_workers=8,
         batch_size=16,

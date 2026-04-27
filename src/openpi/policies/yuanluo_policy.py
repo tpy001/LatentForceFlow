@@ -106,47 +106,61 @@ class YuanluoOutputs(transforms.DataTransformFn):
 class YuanluoTaVLAInputs(YuanluoInputs):
     use_future_rgb_instead_of_flow: bool = False
 
-    def _split_head_camera(
+    def _split_camera_stream(
         self,
-        head_camera,
+        camera,
         *,
+        camera_name: str,
         require_future_frame: bool,
     ) -> tuple[np.ndarray, np.ndarray | None]:
-        head_camera = np.asarray(head_camera)
+        camera = np.asarray(camera)
         if not self.use_future_rgb_instead_of_flow:
-            return _parse_image(head_camera), None
+            return _parse_image(camera), None
 
-        if head_camera.ndim < 4:
+        if camera.ndim < 4:
             if require_future_frame:
                 raise ValueError(
-                    "YuanluoTaVLAInputs expected `observation.images.head_camera` to contain "
+                    f"YuanluoTaVLAInputs expected `{camera_name}` to contain "
                     "current and future frames when `use_future_rgb_instead_of_flow=True`."
                 )
-            return _parse_image(head_camera), None
+            return _parse_image(camera), None
 
-        if head_camera.shape[0] < 2:
+        if camera.shape[0] < 2:
             if require_future_frame:
                 raise ValueError(
-                    "YuanluoTaVLAInputs expected `observation.images.head_camera` to contain "
+                    f"YuanluoTaVLAInputs expected `{camera_name}` to contain "
                     "current and future frames when `use_future_rgb_instead_of_flow=True`."
                 )
-            return _parse_image(head_camera[0]), None
+            return _parse_image(camera[0]), None
 
-        current_frame = _parse_image(head_camera[0])
-        future_frame = _parse_image(head_camera[1])
+        current_frame = _parse_image(camera[0])
+        future_frame = _parse_image(camera[1])
         return current_frame, future_frame
 
     def __call__(self, data: dict) -> dict:
-        current_head_camera, future_rgb_img = self._split_head_camera(
+        current_head_camera, future_rgb_img = self._split_camera_stream(
             data["observation.images.head_camera"],
+            camera_name="observation.images.head_camera",
+            require_future_frame="action" in data,
+        )
+        current_wrist_camera, future_wrist_rgb_img = self._split_camera_stream(
+            data["observation.images.wrist_left_camera"],
+            camera_name="observation.images.wrist_left_camera",
             require_future_frame="action" in data,
         )
         data = dict(data)
         data["observation.images.head_camera"] = current_head_camera
+        data["observation.images.wrist_left_camera"] = current_wrist_camera
         inputs = super().__call__(data)
         inputs["effort"] = data["observation.effort"] # Append 6-axis force sensor data 
         if future_rgb_img is not None:
             inputs["future_rgb_img"] = future_rgb_img
+        if future_wrist_rgb_img is not None:
+            inputs["future_wrist_rgb_img"] = future_wrist_rgb_img
+        if "observation.images.future_flow" in data:
+            inputs["flow_img"] = _parse_image(data["observation.images.future_flow"])
+        if "observation.images.future_wrist_flow" in data:
+            inputs["wrist_flow_img"] = _parse_image(data["observation.images.future_wrist_flow"])
         
         # Optionally pass through contact-related supervision signals if present
         if "observation.is_contact" in data:

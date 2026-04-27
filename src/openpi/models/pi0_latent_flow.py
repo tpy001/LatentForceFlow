@@ -169,7 +169,12 @@ class Pi0LatentFlow(_model.BaseModel):
         )
 
         self.flow_vae_latent_channels = int(config.flow_vae_latent_channels)
-        self.flow_vae_proj_in = nnx.Linear(self.flow_vae_latent_channels, self.teacher_width, rngs=rngs)
+        self.flow_vae_patch_merge_factor = 2
+        self.flow_vae_proj_in = nnx.Linear(
+            self.flow_vae_latent_channels * (self.flow_vae_patch_merge_factor ** 2),
+            self.teacher_width,
+            rngs=rngs,
+        )
         self.flow_vae_proj_out = nnx.Linear(self.teacher_width, self.teacher_width, rngs=rngs)
         self.flow_vae_norm = nnx.LayerNorm(num_features=self.teacher_width, rngs=rngs)
         self.flow_vae_query_proj = nnx.Linear(self.teacher_width, self.teacher_width, rngs=rngs)
@@ -410,34 +415,60 @@ class Pi0LatentFlow(_model.BaseModel):
     def _restore_aux_images(
         processed: _model.Observation,
         original_flow_img: at.Array | None,
+        original_wrist_flow_img: at.Array | None,
         original_future_rgb_img: at.Array | None,
+        original_future_wrist_rgb_img: at.Array | None,
     ) -> _model.Observation:
         updates = {}
         if original_flow_img is not None:
             updates["flow_img"] = original_flow_img
+        if original_wrist_flow_img is not None:
+            updates["wrist_flow_img"] = original_wrist_flow_img
         if original_future_rgb_img is not None:
             updates["future_rgb_img"] = original_future_rgb_img
+        if original_future_wrist_rgb_img is not None:
+            updates["future_wrist_rgb_img"] = original_future_wrist_rgb_img
         if not updates:
             return processed
         return processed.replace(**updates)
 
-    def _require_flow_img(self, obs: _model.Observation) -> at.Array:
-        if obs.flow_img is None:
-            raise ValueError("Pi0LatentFlow requires `observation.flow_img` for flow distillation.")
-        return obs.flow_img
+    @staticmethod
+    def _require_aux_image(
+        image: at.Array | None,
+        *,
+        field_name: str,
+        mode_name: str,
+    ) -> at.Array:
+        if image is None:
+            raise ValueError(f"Pi0LatentFlow requires `{field_name}` for {mode_name}.")
+        return image
 
-    def _require_future_rgb_img(self, obs: _model.Observation) -> at.Array:
-        if obs.future_rgb_img is None:
-            raise ValueError(
-                "Pi0LatentFlow requires `observation.future_rgb_img` for RGB ablation "
-                "when `use_future_rgb_instead_of_flow=True`."
-            )
-        return obs.future_rgb_img
-
-    def _get_future_visual_image(self, obs: _model.Observation) -> at.Array:
+    def _get_future_visual_images(self, obs: _model.Observation) -> tuple[at.Array, at.Array]:
         if self.use_future_rgb_instead_of_flow:
-            return self._require_future_rgb_img(obs)
-        return self._require_flow_img(obs)
+            return (
+                self._require_aux_image(
+                    obs.future_rgb_img,
+                    field_name="observation.future_rgb_img",
+                    mode_name="RGB ablation when `use_future_rgb_instead_of_flow=True`",
+                ),
+                self._require_aux_image(
+                    obs.future_wrist_rgb_img,
+                    field_name="observation.future_wrist_rgb_img",
+                    mode_name="RGB ablation when `use_future_rgb_instead_of_flow=True`",
+                ),
+            )
+        return (
+            self._require_aux_image(
+                obs.flow_img,
+                field_name="observation.flow_img",
+                mode_name="flow distillation",
+            ),
+            self._require_aux_image(
+                obs.wrist_flow_img,
+                field_name="observation.wrist_flow_img",
+                mode_name="flow distillation",
+            ),
+        )
 
     def _encode_future_visual_image(self, image: at.Float[at.Array, "b h w c"]) -> at.Float[at.Array, "b s d"]:
         x = jnp.asarray(image, dtype=jnp.float32)
@@ -459,12 +490,30 @@ class Pi0LatentFlow(_model.BaseModel):
         ).latent_dist
         x = posterior.mode() * flow_vae.config.scaling_factor
         x = jax.lax.stop_gradient(x)
+        patch = self.flow_vae_patch_merge_factor
+        if x.shape[1] % patch != 0 or x.shape[2] % patch != 0:
+            raise ValueError(
+                "Future visual latent spatial size must be divisible by "
+                f"{patch}, got shape={x.shape}."
+            )
+        x = einops.rearrange(
+            x,
+            "b (h ph) (w pw) c -> b h w (ph pw c)",
+            ph=patch,
+            pw=patch,
+        )
         latent_tokens = einops.rearrange(x, "b h w c -> b (h w) c")
         latent_tokens = self.flow_vae_proj_in(latent_tokens)
         latent_tokens = nnx.swish(latent_tokens)
         latent_tokens = self.flow_vae_proj_out(latent_tokens)
-        latent_tokens = self.flow_vae_norm(latent_tokens)
+        return self.flow_vae_norm(latent_tokens)
 
+    def _compress_future_flows(self, obs: _model.Observation) -> at.Float[at.Array, "b n d"]:
+        future_images = self._get_future_visual_images(obs)
+        latent_tokens = jnp.concatenate(
+            [self._encode_future_visual_image(image) for image in future_images],
+            axis=1,
+        )
         query = jnp.asarray(self.teacher_future_flow_query.value, dtype=latent_tokens.dtype)
         query = query + jnp.asarray(self.flow_token_embedding.value, dtype=latent_tokens.dtype)
         query = jnp.broadcast_to(query[None, :, :], (latent_tokens.shape[0], query.shape[0], query.shape[1]))
@@ -476,9 +525,6 @@ class Pi0LatentFlow(_model.BaseModel):
         logits = logits / jnp.sqrt(jnp.asarray(self.teacher_width, dtype=logits.dtype))
         attn = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(values.dtype)
         return jnp.einsum("bqk,bkd->bqd", attn, values)
-
-    def _compress_future_flows(self, obs: _model.Observation) -> at.Float[at.Array, "b n d"]:
-        return self._encode_future_visual_image(self._get_future_visual_image(obs))
 
     @at.typecheck
     def embed_student_suffix(
@@ -624,11 +670,19 @@ class Pi0LatentFlow(_model.BaseModel):
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
         original_flow_img = observation.flow_img
+        original_wrist_flow_img = observation.wrist_flow_img
         original_future_rgb_img = observation.future_rgb_img
+        original_future_wrist_rgb_img = observation.future_wrist_rgb_img
         observation = _model.preprocess_observation(
             preprocess_rng, observation, train=train, effort_type=self.effort_type
         )
-        observation = self._restore_aux_images(observation, original_flow_img, original_future_rgb_img)
+        observation = self._restore_aux_images(
+            observation,
+            original_flow_img,
+            original_wrist_flow_img,
+            original_future_rgb_img,
+            original_future_wrist_rgb_img,
+        )
         history_effort, future_effort = self._split_effort(observation, require_future=True, dtype=actions.dtype)
         if future_effort is None:
             raise ValueError("Pi0MORDualAlignForceFlow teacher training requires future effort.")
@@ -723,9 +777,17 @@ class Pi0LatentFlow(_model.BaseModel):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
         original_flow_img = observation.flow_img
+        original_wrist_flow_img = observation.wrist_flow_img
         original_future_rgb_img = observation.future_rgb_img
+        original_future_wrist_rgb_img = observation.future_wrist_rgb_img
         observation = _model.preprocess_observation(None, observation, train=False, effort_type=self.effort_type)
-        observation = self._restore_aux_images(observation, original_flow_img, original_future_rgb_img)
+        observation = self._restore_aux_images(
+            observation,
+            original_flow_img,
+            original_wrist_flow_img,
+            original_future_rgb_img,
+            original_future_wrist_rgb_img,
+        )
         history_effort, _ = self._split_effort(observation, require_future=False, dtype=jnp.float32)
 
         dt = -1.0 / num_steps
