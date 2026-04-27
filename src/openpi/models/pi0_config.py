@@ -156,6 +156,7 @@ class Pi0LatentFlowConfig(Pi0Config):
     flow_vae_latent_channels: int = 4
     use_future_rgb_instead_of_flow: bool = False
     future_rgb_step: int = 0
+    student_future_query_mask_prob: float = 0.0
 
     @override
     def __post_init__(self):
@@ -164,6 +165,11 @@ class Pi0LatentFlowConfig(Pi0Config):
             raise ValueError(
                 f"future_rgb_step must satisfy 0 <= future_rgb_step <= action_horizon={self.action_horizon}, "
                 f"got {self.future_rgb_step}."
+            )
+        if not 0.0 <= self.student_future_query_mask_prob <= 1.0:
+            raise ValueError(
+                "student_future_query_mask_prob must satisfy 0.0 <= p <= 1.0, "
+                f"got {self.student_future_query_mask_prob}."
             )
     
     @override
