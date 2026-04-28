@@ -68,7 +68,11 @@ class Pi0LatentFlow(_model.BaseModel):
         self.flow_vae_name = getattr(config, "flow_vae_name", "stabilityai/sdxl-vae")
         self.use_future_rgb_instead_of_flow = bool(config.use_future_rgb_instead_of_flow)
         self.future_rgb_step = int(config.future_rgb_step)
-        self.student_future_query_mask_prob = float(config.student_future_query_mask_prob)
+        self.student_future_query_noise_prob_max = float(config.student_future_query_noise_prob_max)
+        self.student_future_query_noise_start_ratio = float(config.student_future_query_noise_start_ratio)
+        self.student_future_query_noise_end_ratio = float(config.student_future_query_noise_end_ratio)
+        self.student_future_query_noise_scale = float(config.student_future_query_noise_scale)
+        self.uses_train_progress = True
         self._debug_lengths_logged = False
 
 
@@ -259,14 +263,15 @@ class Pi0LatentFlow(_model.BaseModel):
         query = jnp.asarray(self.student_query.value, dtype=dtype)
         return jnp.broadcast_to(query[None, None, :], (batch_size, 1, query.shape[0]))
 
-    def _student_shared_mask_tokens(
-        self,
-        batch_size: int,
-        token_count: int,
-        dtype: jnp.dtype,
-    ) -> at.Float[at.Array, "b t d"]:
-        token = jnp.asarray(self.student_future_mask_token.value, dtype=dtype)
-        return jnp.broadcast_to(token[None, None, :], (batch_size, token_count, token.shape[0]))
+    def _student_query_noise_prob(self, train_progress: at.Float[at.Array, ""] | float | None) -> at.Float[at.Array, ""]:
+        if train_progress is None:
+            return jnp.asarray(0.0, dtype=jnp.float32)
+        progress = jnp.clip(jnp.asarray(train_progress, dtype=jnp.float32), 0.0, 1.0)
+        start = jnp.asarray(self.student_future_query_noise_start_ratio, dtype=jnp.float32)
+        end = jnp.asarray(self.student_future_query_noise_end_ratio, dtype=jnp.float32)
+        max_prob = jnp.asarray(self.student_future_query_noise_prob_max, dtype=jnp.float32)
+        ramp = (progress - start) / jnp.maximum(end - start, 1e-6)
+        return max_prob * jnp.clip(ramp, 0.0, 1.0)
 
     def _student_future_query_tokens(
         self,
@@ -274,35 +279,65 @@ class Pi0LatentFlow(_model.BaseModel):
         dtype: jnp.dtype,
         *,
         train: bool,
-        mask_rng: at.KeyArrayLike | None,
+        noise_rng: at.KeyArrayLike | None,
+        train_progress: at.Float[at.Array, ""] | float | None = None,
+        query_noise_prob: at.Float[at.Array, ""] | float | None = None,
+        query_noise_scale: at.Float[at.Array, ""] | float | None = None,
     ) -> tuple[
         at.Float[at.Array, "b 1 d"],
         at.Float[at.Array, "b n d"],
         at.Bool[at.Array, "b"],
+        at.Bool[at.Array, "b n"],
+        at.Float[at.Array, "b"],
     ]:
         future_force_query = self._student_query_token(batch_size, dtype)
         future_flow_queries = self._student_future_flow_tokens(batch_size, dtype)
-        if not train or self.student_future_query_mask_prob <= 0.0:
-            return future_force_query, future_flow_queries, jnp.ones((batch_size,), dtype=jnp.bool_)
-
-        if mask_rng is None:
-            raise ValueError("mask_rng is required when training with student future query masking enabled.")
-
-        if self.student_future_query_mask_prob >= 1.0:
-            future_query_mask = jnp.ones((batch_size,), dtype=jnp.bool_)
-        else:
-            future_query_mask = jax.random.bernoulli(
-                mask_rng,
-                p=self.student_future_query_mask_prob,
-                shape=(batch_size,),
+        noise_prob = (
+            self._student_query_noise_prob(train_progress)
+            if query_noise_prob is None
+            else jnp.asarray(query_noise_prob, dtype=jnp.float32)
+        )
+        noise_prob = jnp.clip(noise_prob, 0.0, 1.0)
+        noise_scale = (
+            jnp.asarray(self.student_future_query_noise_scale, dtype=dtype)
+            if query_noise_scale is None
+            else jnp.asarray(query_noise_scale, dtype=dtype)
+        )
+        if not train and query_noise_prob is None:
+            return (
+                future_force_query,
+                future_flow_queries,
+                jnp.ones((batch_size,), dtype=jnp.bool_),
+                jnp.ones((batch_size, self.flow_token_count), dtype=jnp.bool_),
+                jnp.zeros((batch_size,), dtype=jnp.float32),
             )
+        if query_noise_prob is None and float(self.student_future_query_noise_prob_max) <= 0.0:
+            return (
+                future_force_query,
+                future_flow_queries,
+                jnp.ones((batch_size,), dtype=jnp.bool_),
+                jnp.ones((batch_size, self.flow_token_count), dtype=jnp.bool_),
+                jnp.zeros((batch_size,), dtype=jnp.float32),
+            )
+        if noise_rng is None:
+            raise ValueError("noise_rng is required when training with student future query noise enabled.")
 
-        mask_force_query = self._student_shared_mask_tokens(batch_size, 1, dtype)
-        mask_flow_queries = self._student_shared_mask_tokens(batch_size, self.flow_token_count, dtype)
-        query_mask = future_query_mask[:, None, None]
-        future_force_query = jnp.where(query_mask, mask_force_query, future_force_query)
-        future_flow_queries = jnp.where(query_mask, mask_flow_queries, future_flow_queries)
-        return future_force_query, future_flow_queries, jnp.logical_not(future_query_mask)
+        force_rng, flow_rng, force_noise_rng, flow_noise_rng = jax.random.split(noise_rng, 4)
+        force_noise_mask = jax.random.bernoulli(force_rng, p=noise_prob, shape=(batch_size, 1))
+        flow_noise_mask = jax.random.bernoulli(flow_rng, p=noise_prob, shape=(batch_size, self.flow_token_count))
+
+        force_noise = noise_scale * jax.random.normal(force_noise_rng, future_force_query.shape, dtype=dtype)
+        flow_noise = noise_scale * jax.random.normal(flow_noise_rng, future_flow_queries.shape, dtype=dtype)
+
+        future_force_query = jnp.where(force_noise_mask[:, :, None], force_noise, future_force_query)
+        future_flow_queries = jnp.where(flow_noise_mask[:, :, None], flow_noise, future_flow_queries)
+        force_clean_mask = jnp.logical_not(jnp.squeeze(force_noise_mask, axis=1))
+        flow_clean_mask = jnp.logical_not(flow_noise_mask)
+        noised_token_count = jnp.squeeze(force_noise_mask.astype(jnp.float32), axis=1) + jnp.sum(
+            flow_noise_mask.astype(jnp.float32), axis=1
+        )
+        total_token_count = jnp.asarray(1 + self.flow_token_count, dtype=jnp.float32)
+        return future_force_query, future_flow_queries, force_clean_mask, flow_clean_mask, noised_token_count / total_token_count
 
     def _project_prompt_distill(self, hidden: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t d"]:
         hidden = self.prompt_distill_proj_in(hidden)
@@ -341,6 +376,22 @@ class Pi0LatentFlow(_model.BaseModel):
         rhs_norm = rhs / jnp.sqrt(jnp.sum(jnp.square(rhs), axis=-1, keepdims=True) + 1e-6)
         cosine = jnp.sum(lhs_norm * rhs_norm, axis=-1)
         return jnp.mean(1.0 - cosine, axis=-1)
+
+    @staticmethod
+    def _cosine_distance_masked(
+        lhs: at.Float[at.Array, "b t d"],
+        rhs: at.Float[at.Array, "b t d"],
+        token_mask: at.Bool[at.Array, "b t"],
+    ) -> at.Float[at.Array, " b"]:
+        lhs = lhs.astype(jnp.float32)
+        rhs = rhs.astype(jnp.float32)
+        lhs_norm = lhs / jnp.sqrt(jnp.sum(jnp.square(lhs), axis=-1, keepdims=True) + 1e-6)
+        rhs_norm = rhs / jnp.sqrt(jnp.sum(jnp.square(rhs), axis=-1, keepdims=True) + 1e-6)
+        cosine = jnp.sum(lhs_norm * rhs_norm, axis=-1)
+        losses = 1.0 - cosine
+        weights = token_mask.astype(losses.dtype)
+        denom = jnp.maximum(jnp.sum(weights, axis=-1), jnp.asarray(1.0, dtype=losses.dtype))
+        return jnp.sum(losses * weights, axis=-1) / denom
 
     @at.typecheck
     def embed_prefix(
@@ -535,20 +586,28 @@ class Pi0LatentFlow(_model.BaseModel):
         timestep: at.Float[at.Array, " b"],
         *,
         train: bool = False,
-        mask_rng: at.KeyArrayLike | None = None,
+        noise_rng: at.KeyArrayLike | None = None,
+        train_progress: at.Float[at.Array, ""] | float | None = None,
+        query_noise_prob: at.Float[at.Array, ""] | float | None = None,
+        query_noise_scale: at.Float[at.Array, ""] | float | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
         at.Float[at.Array, "b emb"] | None,
         at.Bool[at.Array, "b"],
+        at.Bool[at.Array, "b n"],
+        at.Float[at.Array, "b"],
     ]:
         history_token = self._project_history_force_student(history_effort)
-        future_force_query, future_flow_queries, distill_enabled_mask = self._student_future_query_tokens(
+        future_force_query, future_flow_queries, force_clean_mask, flow_clean_mask, noised_token_rate = self._student_future_query_tokens(
             obs.state.shape[0],
             history_token.dtype,
             train=train,
-            mask_rng=mask_rng,
+            noise_rng=noise_rng,
+            train_progress=train_progress,
+            query_noise_prob=query_noise_prob,
+            query_noise_scale=query_noise_scale,
         )
         state_token = self.state_proj_student(obs.state)[:, None, :]
         action_tokens, adarms_cond = self._embed_action_tokens(noisy_actions, timestep, expert="student")
@@ -558,7 +617,7 @@ class Pi0LatentFlow(_model.BaseModel):
         )
         input_mask = jnp.ones(tokens.shape[:2], dtype=jnp.bool_)
         ar_mask = self._build_suffix_ar_mask(action_tokens.shape[1])
-        return tokens, input_mask, ar_mask, adarms_cond, distill_enabled_mask
+        return tokens, input_mask, ar_mask, adarms_cond, force_clean_mask, flow_clean_mask, noised_token_rate
 
     @at.typecheck
     def embed_teacher_suffix(
@@ -666,9 +725,15 @@ class Pi0LatentFlow(_model.BaseModel):
         return student_out, teacher_out, student_layer_hiddens, teacher_layer_hiddens
 
     def compute_loss_with_stats(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        train_progress: at.Float[at.Array, ""] | float | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
-        preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
+        preprocess_rng, noise_rng, time_rng, query_noise_rng = jax.random.split(rng, 4)
         original_flow_img = observation.flow_img
         original_wrist_flow_img = observation.wrist_flow_img
         original_future_rgb_img = observation.future_rgb_img
@@ -695,8 +760,22 @@ class Pi0LatentFlow(_model.BaseModel):
         u_t_action = noise - actions
 
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        student_tokens, student_mask, student_ar_mask, student_adarms, distill_enabled_mask = self.embed_student_suffix(
-            observation, history_effort, x_t_action, time, train=train, mask_rng=mask_rng
+        (
+            student_tokens,
+            student_mask,
+            student_ar_mask,
+            student_adarms,
+            force_clean_mask,
+            flow_clean_mask,
+            noised_token_rate,
+        ) = self.embed_student_suffix(
+            observation,
+            history_effort,
+            x_t_action,
+            time,
+            train=train,
+            noise_rng=query_noise_rng,
+            train_progress=train_progress,
         )
         teacher_tokens, teacher_mask, teacher_ar_mask, teacher_adarms = self.embed_teacher_suffix(
             observation, history_effort, future_effort, x_t_action, time
@@ -727,16 +806,27 @@ class Pi0LatentFlow(_model.BaseModel):
         for student_hidden, teacher_hidden in zip(student_layer_hiddens, teacher_layer_hiddens, strict=True):
             student_force_hidden = self._project_prompt_distill(student_hidden[:, future_force_slice, :])
             teacher_force_hidden = jax.lax.stop_gradient(teacher_hidden[:, future_force_slice, :])
-            force_losses.append(self._cosine_distance(student_force_hidden, teacher_force_hidden))
+            force_losses.append(
+                self._apply_loss_mask(
+                    self._cosine_distance(student_force_hidden, teacher_force_hidden),
+                    force_clean_mask,
+                )
+            )
 
             student_flow_hidden = self._project_flow_distill(student_hidden[:, flow_slice, :])
             teacher_flow_hidden = jax.lax.stop_gradient(teacher_hidden[:, flow_slice, :])
-            flow_losses.append(self._cosine_distance(student_flow_hidden, teacher_flow_hidden))
+            flow_losses.append(
+                self._cosine_distance_masked(
+                    student_flow_hidden,
+                    teacher_flow_hidden,
+                    flow_clean_mask,
+                )
+            )
 
         raw_future_force_align_loss = jnp.mean(jnp.stack(force_losses, axis=0), axis=0)
         raw_future_flow_align_loss = jnp.mean(jnp.stack(flow_losses, axis=0), axis=0)
-        future_force_align_loss = self._apply_loss_mask(raw_future_force_align_loss, distill_enabled_mask)
-        future_flow_align_loss = self._apply_loss_mask(raw_future_flow_align_loss, distill_enabled_mask)
+        future_force_align_loss = raw_future_force_align_loss
+        future_flow_align_loss = raw_future_flow_align_loss
 
         total_loss = (
             self.student_action_loss_weight * student_action_loss
@@ -749,23 +839,24 @@ class Pi0LatentFlow(_model.BaseModel):
             "loss/teacher_action": teacher_action_loss,
             "loss/distill_future_force": future_force_align_loss,
             "loss/distill_future_flow": future_flow_align_loss,
-            "loss/distill_future_force_unmasked_mean": self._masked_mean(
-                raw_future_force_align_loss,
-                distill_enabled_mask,
-            ),
-            "loss/distill_future_flow_unmasked_mean": self._masked_mean(
-                raw_future_flow_align_loss,
-                distill_enabled_mask,
-            ),
-            "mask/student_future_query_rate": jnp.mean((~distill_enabled_mask).astype(jnp.float32)),
+            "loss/distill_future_force_mean": jnp.mean(raw_future_force_align_loss),
+            "loss/distill_future_flow_mean": jnp.mean(raw_future_flow_align_loss),
+            "noise/student_future_query_token_rate": jnp.mean(noised_token_rate),
+            "noise/student_future_query_prob": self._student_query_noise_prob(train_progress),
             "loss/total": total_loss,
         }
         return total_loss, stats
 
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        train_progress: at.Float[at.Array, ""] | float | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
-        loss, _ = self.compute_loss_with_stats(rng, observation, actions, train=train)
+        loss, _ = self.compute_loss_with_stats(rng, observation, actions, train=train, train_progress=train_progress)
         return loss
 
     def sample_actions(
@@ -775,6 +866,8 @@ class Pi0LatentFlow(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        debug_query_noise_prob: float | None = None,
+        debug_query_noise_scale: float | None = None,
     ) -> _model.Actions:
         original_flow_img = observation.flow_img
         original_wrist_flow_img = observation.wrist_flow_img
@@ -792,8 +885,9 @@ class Pi0LatentFlow(_model.BaseModel):
 
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
+        action_noise_rng, query_noise_rng = jax.random.split(rng)
         if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+            noise = jax.random.normal(action_noise_rng, (batch_size, self.action_horizon, self.action_dim))
 
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
@@ -806,13 +900,17 @@ class Pi0LatentFlow(_model.BaseModel):
         )
 
         def step(carry):
-            x_t, time = carry
-            student_tokens, student_mask, student_ar_mask, student_adarms, _ = self.embed_student_suffix(
+            x_t, time, step_rng = carry
+            step_rng, iter_query_noise_rng = jax.random.split(step_rng)
+            student_tokens, student_mask, student_ar_mask, student_adarms, *_ = self.embed_student_suffix(
                 observation,
                 history_effort,
                 x_t,
                 jnp.broadcast_to(time, batch_size),
                 train=False,
+                noise_rng=iter_query_noise_rng,
+                query_noise_prob=debug_query_noise_prob,
+                query_noise_scale=debug_query_noise_scale,
             )
             student_attn_mask = make_attn_mask(student_mask, student_ar_mask)
             prefix_to_student = einops.repeat(prefix_mask, "b p -> b s p", s=student_tokens.shape[1])
@@ -828,11 +926,11 @@ class Pi0LatentFlow(_model.BaseModel):
             )
             _, student_out, _ = outputs
             v_t = self.action_out_proj_student(student_out[:, -self.action_horizon :])
-            return x_t + dt * v_t, time + dt
+            return x_t + dt * v_t, time + dt, step_rng
 
         def cond(carry):
-            _, time = carry
+            _, time, _ = carry
             return time >= -dt / 2
 
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        x_0, _, _ = jax.lax.while_loop(cond, step, (noise, 1.0, query_noise_rng))
         return x_0

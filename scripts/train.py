@@ -210,17 +210,26 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
     has_loss_stats = hasattr(model, "compute_loss_with_stats")
+    train_progress = jnp.asarray(state.step, dtype=jnp.float32) / jnp.asarray(max(config.num_train_steps - 1, 1), dtype=jnp.float32)
 
     @at.typecheck
     def loss_fn(
         model, rng, observation, actions
     ):
         if has_loss_stats:
-            chunked_loss, loss_stats = model.compute_loss_with_stats(rng, observation, actions, train=True)
+            if getattr(model, "uses_train_progress", False):
+                chunked_loss, loss_stats = model.compute_loss_with_stats(
+                    rng, observation, actions, train=True, train_progress=train_progress
+                )
+            else:
+                chunked_loss, loss_stats = model.compute_loss_with_stats(rng, observation, actions, train=True)
             # Keep aux stats scalar-friendly for logging.
             reduced_loss_stats = jax.tree.map(jnp.mean, loss_stats)
             return jnp.mean(chunked_loss), reduced_loss_stats
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        if getattr(model, "uses_train_progress", False):
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True, train_progress=train_progress)
+        else:
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)

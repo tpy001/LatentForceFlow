@@ -655,7 +655,7 @@ _CONFIGS = [
         ema_decay = None # 节省显存
     ),
     TrainConfig(
-        name="pi0_latent_flow_mask",
+        name="pi0_latent_flow_noise",
         model=pi0_config.Pi0LatentFlowConfig(
             action_horizon=32,
             effort_type=EffortType.MOT,
@@ -665,7 +665,11 @@ _CONFIGS = [
             distill_layer_indices=(8, 12, 16),
             future_force_align_loss_weight=0.5,
             future_flow_align_loss_weight=0.5,
-            student_future_query_mask_prob=0.3,
+            student_future_query_noise_prob_max=0.3,
+            student_future_query_noise_start_ratio=0.3,
+            student_future_query_noise_end_ratio=0.7,
+            student_future_query_noise_scale=0.02,
+            use_future_rgb_instead_of_flow = False
         ),
         data=LeRobotOptimalFlowDataConfig(
             repo_id="llly/all_0409_stage_flow", # Placeholder, replace with your actual repo_id
