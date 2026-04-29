@@ -68,10 +68,9 @@ class Pi0LatentFlow(_model.BaseModel):
         self.flow_vae_name = getattr(config, "flow_vae_name", "stabilityai/sdxl-vae")
         self.use_future_rgb_instead_of_flow = bool(config.use_future_rgb_instead_of_flow)
         self.future_rgb_step = int(config.future_rgb_step)
-        self.student_future_query_noise_prob_max = float(config.student_future_query_noise_prob_max)
+        self.student_future_query_noise_scale_max = float(config.student_future_query_noise_scale_max)
         self.student_future_query_noise_start_ratio = float(config.student_future_query_noise_start_ratio)
         self.student_future_query_noise_end_ratio = float(config.student_future_query_noise_end_ratio)
-        self.student_future_query_noise_scale = float(config.student_future_query_noise_scale)
         self.uses_train_progress = True
         self._debug_lengths_logged = False
 
@@ -263,15 +262,15 @@ class Pi0LatentFlow(_model.BaseModel):
         query = jnp.asarray(self.student_query.value, dtype=dtype)
         return jnp.broadcast_to(query[None, None, :], (batch_size, 1, query.shape[0]))
 
-    def _student_query_noise_prob(self, train_progress: at.Float[at.Array, ""] | float | None) -> at.Float[at.Array, ""]:
+    def _student_query_noise_scale(self, train_progress: at.Float[at.Array, ""] | float | None) -> at.Float[at.Array, ""]:
         if train_progress is None:
             return jnp.asarray(0.0, dtype=jnp.float32)
         progress = jnp.clip(jnp.asarray(train_progress, dtype=jnp.float32), 0.0, 1.0)
         start = jnp.asarray(self.student_future_query_noise_start_ratio, dtype=jnp.float32)
         end = jnp.asarray(self.student_future_query_noise_end_ratio, dtype=jnp.float32)
-        max_prob = jnp.asarray(self.student_future_query_noise_prob_max, dtype=jnp.float32)
+        max_scale = jnp.asarray(self.student_future_query_noise_scale_max, dtype=jnp.float32)
         ramp = (progress - start) / jnp.maximum(end - start, 1e-6)
-        return max_prob * jnp.clip(ramp, 0.0, 1.0)
+        return max_scale * jnp.clip(ramp, 0.0, 1.0)
 
     def _student_future_query_tokens(
         self,
@@ -281,7 +280,6 @@ class Pi0LatentFlow(_model.BaseModel):
         train: bool,
         noise_rng: at.KeyArrayLike | None,
         train_progress: at.Float[at.Array, ""] | float | None = None,
-        query_noise_prob: at.Float[at.Array, ""] | float | None = None,
         query_noise_scale: at.Float[at.Array, ""] | float | None = None,
     ) -> tuple[
         at.Float[at.Array, "b 1 d"],
@@ -292,18 +290,14 @@ class Pi0LatentFlow(_model.BaseModel):
     ]:
         future_force_query = self._student_query_token(batch_size, dtype)
         future_flow_queries = self._student_future_flow_tokens(batch_size, dtype)
-        noise_prob = (
-            self._student_query_noise_prob(train_progress)
-            if query_noise_prob is None
-            else jnp.asarray(query_noise_prob, dtype=jnp.float32)
-        )
-        noise_prob = jnp.clip(noise_prob, 0.0, 1.0)
-        noise_scale = (
-            jnp.asarray(self.student_future_query_noise_scale, dtype=dtype)
+        noise_scale_f32 = (
+            self._student_query_noise_scale(train_progress)
             if query_noise_scale is None
-            else jnp.asarray(query_noise_scale, dtype=dtype)
+            else jnp.asarray(query_noise_scale, dtype=jnp.float32)
         )
-        if not train and query_noise_prob is None:
+        noise_scale_f32 = jnp.maximum(noise_scale_f32, 0.0)
+        noise_scale = noise_scale_f32.astype(dtype)
+        if not train and query_noise_scale is None:
             return (
                 future_force_query,
                 future_flow_queries,
@@ -311,7 +305,7 @@ class Pi0LatentFlow(_model.BaseModel):
                 jnp.ones((batch_size, self.flow_token_count), dtype=jnp.bool_),
                 jnp.zeros((batch_size,), dtype=jnp.float32),
             )
-        if query_noise_prob is None and float(self.student_future_query_noise_prob_max) <= 0.0:
+        if query_noise_scale is None and float(self.student_future_query_noise_scale_max) <= 0.0:
             return (
                 future_force_query,
                 future_flow_queries,
@@ -322,22 +316,28 @@ class Pi0LatentFlow(_model.BaseModel):
         if noise_rng is None:
             raise ValueError("noise_rng is required when training with student future query noise enabled.")
 
-        force_rng, flow_rng, force_noise_rng, flow_noise_rng = jax.random.split(noise_rng, 4)
-        force_noise_mask = jax.random.bernoulli(force_rng, p=noise_prob, shape=(batch_size, 1))
-        flow_noise_mask = jax.random.bernoulli(flow_rng, p=noise_prob, shape=(batch_size, self.flow_token_count))
-
-        force_noise = noise_scale * jax.random.normal(force_noise_rng, future_force_query.shape, dtype=dtype)
-        flow_noise = noise_scale * jax.random.normal(flow_noise_rng, future_flow_queries.shape, dtype=dtype)
-
-        future_force_query = jnp.where(force_noise_mask[:, :, None], force_noise, future_force_query)
-        future_flow_queries = jnp.where(flow_noise_mask[:, :, None], flow_noise, future_flow_queries)
-        force_clean_mask = jnp.logical_not(jnp.squeeze(force_noise_mask, axis=1))
-        flow_clean_mask = jnp.logical_not(flow_noise_mask)
-        noised_token_count = jnp.squeeze(force_noise_mask.astype(jnp.float32), axis=1) + jnp.sum(
-            flow_noise_mask.astype(jnp.float32), axis=1
+        force_noise_rng, flow_noise_rng = jax.random.split(noise_rng)
+        force_rms = jnp.sqrt(
+            jnp.mean(jnp.square(future_force_query.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-6
         )
-        total_token_count = jnp.asarray(1 + self.flow_token_count, dtype=jnp.float32)
-        return future_force_query, future_flow_queries, force_clean_mask, flow_clean_mask, noised_token_count / total_token_count
+        flow_rms = jnp.sqrt(
+            jnp.mean(jnp.square(future_flow_queries.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-6
+        )
+        force_noise = noise_scale * force_rms.astype(dtype) * jax.random.normal(
+            force_noise_rng, future_force_query.shape, dtype=dtype
+        )
+        flow_noise = noise_scale * flow_rms.astype(dtype) * jax.random.normal(
+            flow_noise_rng, future_flow_queries.shape, dtype=dtype
+        )
+
+        future_force_query = future_force_query + force_noise
+        future_flow_queries = future_flow_queries + flow_noise
+        noised_token_rate = jnp.ones((batch_size,), dtype=jnp.float32) * jnp.where(
+            noise_scale_f32 > 0.0, 1.0, 0.0
+        )
+        force_clean_mask = jnp.ones((batch_size,), dtype=jnp.bool_)
+        flow_clean_mask = jnp.ones((batch_size, self.flow_token_count), dtype=jnp.bool_)
+        return future_force_query, future_flow_queries, force_clean_mask, flow_clean_mask, noised_token_rate
 
     def _project_prompt_distill(self, hidden: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t d"]:
         hidden = self.prompt_distill_proj_in(hidden)
@@ -588,7 +588,6 @@ class Pi0LatentFlow(_model.BaseModel):
         train: bool = False,
         noise_rng: at.KeyArrayLike | None = None,
         train_progress: at.Float[at.Array, ""] | float | None = None,
-        query_noise_prob: at.Float[at.Array, ""] | float | None = None,
         query_noise_scale: at.Float[at.Array, ""] | float | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
@@ -606,7 +605,6 @@ class Pi0LatentFlow(_model.BaseModel):
             train=train,
             noise_rng=noise_rng,
             train_progress=train_progress,
-            query_noise_prob=query_noise_prob,
             query_noise_scale=query_noise_scale,
         )
         state_token = self.state_proj_student(obs.state)[:, None, :]
@@ -842,7 +840,7 @@ class Pi0LatentFlow(_model.BaseModel):
             "loss/distill_future_force_mean": jnp.mean(raw_future_force_align_loss),
             "loss/distill_future_flow_mean": jnp.mean(raw_future_flow_align_loss),
             "noise/student_future_query_token_rate": jnp.mean(noised_token_rate),
-            "noise/student_future_query_prob": self._student_query_noise_prob(train_progress),
+            "noise/student_future_query_scale": self._student_query_noise_scale(train_progress),
             "loss/total": total_loss,
         }
         return total_loss, stats
@@ -866,7 +864,6 @@ class Pi0LatentFlow(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
-        debug_query_noise_prob: float | None = None,
         debug_query_noise_scale: float | None = None,
     ) -> _model.Actions:
         original_flow_img = observation.flow_img
@@ -909,7 +906,6 @@ class Pi0LatentFlow(_model.BaseModel):
                 jnp.broadcast_to(time, batch_size),
                 train=False,
                 noise_rng=iter_query_noise_rng,
-                query_noise_prob=debug_query_noise_prob,
                 query_noise_scale=debug_query_noise_scale,
             )
             student_attn_mask = make_attn_mask(student_mask, student_ar_mask)

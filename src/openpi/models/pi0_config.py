@@ -156,10 +156,9 @@ class Pi0LatentFlowConfig(Pi0Config):
     flow_vae_latent_channels: int = 4
     use_future_rgb_instead_of_flow: bool = False
     future_rgb_step: int = 0
-    student_future_query_noise_prob_max: float = 0.3
-    student_future_query_noise_start_ratio: float = 0.3
-    student_future_query_noise_end_ratio: float = 0.7
-    student_future_query_noise_scale: float = 0.02
+    student_future_query_noise_scale_max: float = 0
+    student_future_query_noise_start_ratio: float = 0
+    student_future_query_noise_end_ratio: float = 0
 
     @override
     def __post_init__(self):
@@ -169,10 +168,10 @@ class Pi0LatentFlowConfig(Pi0Config):
                 f"future_rgb_step must satisfy 0 <= future_rgb_step <= action_horizon={self.action_horizon}, "
                 f"got {self.future_rgb_step}."
             )
-        if not 0.0 <= self.student_future_query_noise_prob_max <= 1.0:
+        if self.student_future_query_noise_scale_max < 0.0:
             raise ValueError(
-                "student_future_query_noise_prob_max must satisfy 0.0 <= p <= 1.0, "
-                f"got {self.student_future_query_noise_prob_max}."
+                "student_future_query_noise_scale_max must be non-negative, "
+                f"got {self.student_future_query_noise_scale_max}."
             )
         if not 0.0 <= self.student_future_query_noise_start_ratio <= 1.0:
             raise ValueError(
@@ -190,11 +189,7 @@ class Pi0LatentFlowConfig(Pi0Config):
                 f"got start={self.student_future_query_noise_start_ratio}, "
                 f"end={self.student_future_query_noise_end_ratio}."
             )
-        if self.student_future_query_noise_scale < 0.0:
-            raise ValueError(
-                f"student_future_query_noise_scale must be non-negative, got {self.student_future_query_noise_scale}."
-            )
-    
+
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0":
         from openpi.models.pi0_latent_flow import Pi0LatentFlow
