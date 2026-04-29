@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
+from openpi.models import model_tavla as _model_tavla
 import openpi.models.gemma as _gemma
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -138,6 +139,73 @@ class Pi0TaVLAConfig(Pi0Config):
         if self.effort_type in {EffortType.LLM_HIS_Lang, }:
             object.__setattr__(self, "max_token_len", 300 if self.pi05 else 48)
             object.__setattr__(self, "discrete_effort_input", True)
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0SeerConfig(Pi0TaVLAConfig):
+    foreseen_token_count_per_view: int = 10
+    future_image_views: tuple[str, ...] = ("base_0_rgb", "left_wrist_0_rgb")
+    future_rgb_step: int = 0
+    image_decoder_patch_size: int = 16
+    image_decoder_input_size: int = 224
+    future_image_loss_weight: float = 0.1
+    predict_future_image_during_inference: bool = False
+    use_future_rgb_instead_of_flow: bool = True
+    normalize_future_patch_targets: bool = True
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0":
+        from openpi.models.pi0_seer import Pi0Seer
+
+        return Pi0Seer(self, rngs=nnx.Rngs(rng))
+
+    @override
+    def __post_init__(self):
+        super().__post_init__()
+        if self.foreseen_token_count_per_view <= 0:
+            raise ValueError("foreseen_token_count_per_view must be positive.")
+        if self.image_decoder_patch_size <= 0:
+            raise ValueError("image_decoder_patch_size must be positive.")
+        if self.image_decoder_input_size % self.image_decoder_patch_size != 0:
+            raise ValueError(
+                "image_decoder_input_size must be divisible by image_decoder_patch_size, "
+                f"got {self.image_decoder_input_size} and {self.image_decoder_patch_size}."
+            )
+        if not 0 <= self.future_rgb_step <= self.action_horizon:
+            raise ValueError(
+                f"future_rgb_step must satisfy 0 <= future_rgb_step <= action_horizon={self.action_horizon}, "
+                f"got {self.future_rgb_step}."
+            )
+
+    @override
+    def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model_tavla.Observation, _model_tavla.Actions]:
+        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+        effort_dim = self.effort_dim if self.effort_dim is not None else self.action_dim
+        effort_dim_in = getattr(self, "effort_dim_in", effort_dim)
+        effort_steps = max(1, effort_dim_in // max(effort_dim, 1))
+
+        with at.disable_typechecking():
+            observation_spec = _model_tavla.Observation(
+                images={
+                    "base_0_rgb": image_spec,
+                    "left_wrist_0_rgb": image_spec,
+                    "right_wrist_0_rgb": image_spec,
+                },
+                image_masks={
+                    "base_0_rgb": image_mask_spec,
+                    "left_wrist_0_rgb": image_mask_spec,
+                    "right_wrist_0_rgb": image_mask_spec,
+                },
+                state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                effort=jax.ShapeDtypeStruct([batch_size, effort_steps, effort_dim], jnp.float32),
+                future_rgb_img=image_spec,
+                future_wrist_rgb_img=image_spec,
+                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+            )
+        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+        return observation_spec, action_spec
 
 
 

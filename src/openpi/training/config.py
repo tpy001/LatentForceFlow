@@ -539,6 +539,33 @@ class TrainConfig:
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
      TrainConfig(
+        name="pi0_seer_0409",
+        model=pi0_config.Pi0SeerConfig(
+            action_horizon=32,
+            effort_type=EffortType.EXPERT_HIS_C_FUT,
+            effort_dim=6,
+            foreseen_token_count_per_view=10,
+            future_rgb_step=32,
+            image_decoder_patch_size=16,
+            image_decoder_input_size=224,
+            future_image_loss_weight=0.1,
+            use_future_rgb_instead_of_flow=True,
+        ),
+        data=LeRobotTaVLADataConfig(
+            repo_id="llly/all_0409_stage_flow",
+            effort_history=tuple((4 * i - 36 for i in range(10))),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        batch_size=16,
+        save_interval=15000,
+        keep_period=15000,
+    ),
+     TrainConfig(
         name="pi0_tavla_0409",
         model=pi0_config.Pi0TaVLAConfig(
             action_horizon=32,
