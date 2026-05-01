@@ -459,7 +459,7 @@ class Pi0LatentFlow(_model.BaseModel):
 
     def _build_suffix_ar_mask(self, action_len: int) -> at.Bool[at.Array, " s"]:
         return jnp.array(
-            [False, False] + [True] + ([False] * self.flow_token_count) + [True] + ([False] * (action_len - 1))
+            [False, False] + ([False] * self.flow_token_count) + [True] + ([False] * (action_len - 1))
         )
 
     @staticmethod
@@ -594,12 +594,11 @@ class Pi0LatentFlow(_model.BaseModel):
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
         at.Float[at.Array, "b emb"] | None,
-        at.Bool[at.Array, "b"],
         at.Bool[at.Array, "b n"],
         at.Float[at.Array, "b"],
     ]:
         history_token = self._project_history_force_student(history_effort)
-        future_force_query, future_flow_queries, force_clean_mask, flow_clean_mask, noised_token_rate = self._student_future_query_tokens(
+        _, future_flow_queries, _, flow_clean_mask, noised_token_rate = self._student_future_query_tokens(
             obs.state.shape[0],
             history_token.dtype,
             train=train,
@@ -610,12 +609,10 @@ class Pi0LatentFlow(_model.BaseModel):
         state_token = self.state_proj_student(obs.state)[:, None, :]
         action_tokens, adarms_cond = self._embed_action_tokens(noisy_actions, timestep, expert="student")
 
-        tokens = jnp.concatenate(
-            [history_token, state_token, future_force_query, future_flow_queries, action_tokens], axis=1
-        )
+        tokens = jnp.concatenate([history_token, state_token, future_flow_queries, action_tokens], axis=1)
         input_mask = jnp.ones(tokens.shape[:2], dtype=jnp.bool_)
         ar_mask = self._build_suffix_ar_mask(action_tokens.shape[1])
-        return tokens, input_mask, ar_mask, adarms_cond, force_clean_mask, flow_clean_mask, noised_token_rate
+        return tokens, input_mask, ar_mask, adarms_cond, flow_clean_mask, noised_token_rate
 
     @at.typecheck
     def embed_teacher_suffix(
@@ -632,14 +629,11 @@ class Pi0LatentFlow(_model.BaseModel):
         at.Float[at.Array, "b emb"] | None,
     ]:
         history_token = self._project_history_force_teacher(history_effort)
-        future_force_token = self._project_future_force_teacher(future_effort)
         future_flow_tokens = self._compress_future_flows(obs)
         state_token = self.state_proj_teacher(obs.state)[:, None, :]
         action_tokens, adarms_cond = self._embed_action_tokens(noisy_actions, timestep, expert="teacher")
 
-        tokens = jnp.concatenate(
-            [history_token, state_token, future_force_token, future_flow_tokens, action_tokens], axis=1
-        )
+        tokens = jnp.concatenate([history_token, state_token, future_flow_tokens, action_tokens], axis=1)
         input_mask = jnp.ones(tokens.shape[:2], dtype=jnp.bool_)
         ar_mask = self._build_suffix_ar_mask(action_tokens.shape[1])
         return tokens, input_mask, ar_mask, adarms_cond
@@ -763,7 +757,6 @@ class Pi0LatentFlow(_model.BaseModel):
             student_mask,
             student_ar_mask,
             student_adarms,
-            force_clean_mask,
             flow_clean_mask,
             noised_token_rate,
         ) = self.embed_student_suffix(
@@ -797,20 +790,9 @@ class Pi0LatentFlow(_model.BaseModel):
         student_action_loss = jnp.mean(jnp.square(student_v - u_t_action), axis=(-2, -1))
         teacher_action_loss = jnp.mean(jnp.square(teacher_v - u_t_action), axis=(-2, -1))
 
-        force_losses = []
         flow_losses = []
-        future_force_slice = slice(2, 3)
-        flow_slice = slice(3, 3 + self.flow_token_count)
+        flow_slice = slice(2, 2 + self.flow_token_count)
         for student_hidden, teacher_hidden in zip(student_layer_hiddens, teacher_layer_hiddens, strict=True):
-            student_force_hidden = self._project_prompt_distill(student_hidden[:, future_force_slice, :])
-            teacher_force_hidden = jax.lax.stop_gradient(teacher_hidden[:, future_force_slice, :])
-            force_losses.append(
-                self._apply_loss_mask(
-                    self._cosine_distance(student_force_hidden, teacher_force_hidden),
-                    force_clean_mask,
-                )
-            )
-
             student_flow_hidden = self._project_flow_distill(student_hidden[:, flow_slice, :])
             teacher_flow_hidden = jax.lax.stop_gradient(teacher_hidden[:, flow_slice, :])
             flow_losses.append(
@@ -821,7 +803,7 @@ class Pi0LatentFlow(_model.BaseModel):
                 )
             )
 
-        raw_future_force_align_loss = jnp.mean(jnp.stack(force_losses, axis=0), axis=0)
+        raw_future_force_align_loss = jnp.zeros_like(student_action_loss)
         raw_future_flow_align_loss = jnp.mean(jnp.stack(flow_losses, axis=0), axis=0)
         future_force_align_loss = raw_future_force_align_loss
         future_flow_align_loss = raw_future_flow_align_loss
