@@ -222,7 +222,7 @@ def create_torch_dataset(
           delta_timestamps["observation.effort"] += [(t + 1) / dataset_meta.fps for t in range(model_config.action_horizon)]
 
     if (
-        isinstance(model_config, pi0_config.Pi0LatentFlowConfig)
+        isinstance(model_config, (pi0_config.Pi0LatentFlowConfig, pi0_config.Pi0SeerConfig))
         and model_config.use_future_rgb_instead_of_flow
     ):
         delta_timestamps["observation.images.head_camera"] = [

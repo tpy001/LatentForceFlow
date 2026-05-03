@@ -5,6 +5,7 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 
+import openpi.models.gemma as _gemma
 from openpi.models import model_tavla as _model
 from openpi.models import pi0_config
 from openpi.models.pi0_tavla import Pi0TaVLA, make_attn_mask
@@ -68,6 +69,7 @@ class FutureImageDecoderBlock(nnx.Module):
 class Pi0Seer(Pi0TaVLA):
     def __init__(self, config: pi0_config.Pi0SeerConfig, rngs: nnx.Rngs):
         super().__init__(config, rngs)
+        paligemma_config = _gemma.get_config(config.paligemma_variant)
         self.foreseen_token_count_per_view = int(config.foreseen_token_count_per_view)
         self.future_image_views = tuple(config.future_image_views)
         self.future_rgb_step = int(config.future_rgb_step)
@@ -91,13 +93,20 @@ class Pi0Seer(Pi0TaVLA):
 
         self.num_future_views = len(self.future_image_views)
         self.total_foreseen_tokens = self.foreseen_token_count_per_view * self.num_future_views
-        action_expert_width = self.action_out_proj.in_features
+        self.prefix_token_width = int(paligemma_config.width)
 
         self.foreseen_tokens = nnx.Param(
-            0.02 * jax.random.normal(rngs.params(), (self.total_foreseen_tokens, action_expert_width), dtype=jnp.float32)
+            0.02
+            * jax.random.normal(
+                rngs.params(),
+                (self.total_foreseen_tokens, self.prefix_token_width),
+                dtype=jnp.float32,
+            )
         )
-        self.image_decoder_hidden_dim = action_expert_width
-        self.image_decoder_projector = nnx.Linear(action_expert_width, self.image_decoder_hidden_dim, rngs=rngs)
+        self.image_decoder_hidden_dim = self.prefix_token_width
+        self.image_decoder_projector = nnx.Linear(
+            self.prefix_token_width, self.image_decoder_hidden_dim, rngs=rngs
+        )
         self.num_mask_tokens = (self.image_decoder_input_size // self.image_decoder_patch_size) ** 2
         self.mask_token = nnx.Param(
             0.02 * jax.random.normal(rngs.params(), (self.image_decoder_hidden_dim,), dtype=jnp.float32)
@@ -110,8 +119,9 @@ class Pi0Seer(Pi0TaVLA):
             self.image_decoder_patch_size * self.image_decoder_patch_size * 3,
             rngs=rngs,
         )
+    def _image_decoder_position_embedding(self) -> at.Float[at.Array, "1 n d"]:
         patch_grid_size = int(round(self.num_mask_tokens ** 0.5))
-        self.image_decoder_position_embedding = jnp.concatenate(
+        return jnp.concatenate(
             [
                 _posemb_1d_from_grid(
                     self.image_decoder_hidden_dim,
@@ -186,7 +196,7 @@ class Pi0Seer(Pi0TaVLA):
             (decoded.shape[0], self.num_mask_tokens, self.image_decoder_hidden_dim),
         )
         decoder_input = jnp.concatenate([decoded, mask_tokens], axis=1)
-        decoder_input = decoder_input + jnp.asarray(self.image_decoder_position_embedding, dtype=decoder_input.dtype)
+        decoder_input = decoder_input + jnp.asarray(self._image_decoder_position_embedding(), dtype=decoder_input.dtype)
         decoder_input = self.image_decoder_block_1(decoder_input)
         decoder_input = self.image_decoder_block_2(decoder_input)
         patch_hidden = self.image_decoder_norm(decoder_input[:, -self.num_mask_tokens :, :])
@@ -203,9 +213,9 @@ class Pi0Seer(Pi0TaVLA):
         return patches
 
     @override
-    def compute_loss(
+    def compute_loss_with_stats(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train, effort_type=self.effort_type)
         if self.effort_type in (
@@ -253,11 +263,31 @@ class Pi0Seer(Pi0TaVLA):
             action_loss = jnp.mean(jnp.square(v_t[..., : self.action_dim] - u_t[..., : self.action_dim]), axis=-1)
             effort_loss = jnp.mean(jnp.square(v_t[..., self.action_dim :] - u_t[..., self.action_dim :]), axis=-1)
             base_loss = action_loss + 0.1 * effort_loss
+            effort_loss_stat = jnp.mean(effort_loss, axis=-1)
         else:
-            base_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+            action_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+            base_loss = action_loss
+            effort_loss_stat = jnp.zeros((base_loss.shape[0],), dtype=base_loss.dtype)
 
         foreseen_hidden = prefix_out[:, -self.total_foreseen_tokens :, :]
         future_image_pred = self._decode_future_images(foreseen_hidden)
         future_image_target = self._future_image_labels(observation)
         future_image_loss = jnp.mean(jnp.square(future_image_pred - future_image_target), axis=(1, 2, 3))
-        return base_loss + self.future_image_loss_weight * future_image_loss
+        action_loss_stat = jnp.mean(action_loss, axis=-1)
+        while future_image_loss.ndim < base_loss.ndim:
+            future_image_loss = future_image_loss[:, None]
+        total_loss = base_loss + self.future_image_loss_weight * future_image_loss
+        stats = {
+            "loss/action": action_loss_stat,
+            "loss/effort": effort_loss_stat,
+            "loss/future_image": future_image_loss[:, 0] if future_image_loss.ndim > 1 else future_image_loss,
+            "loss/total": jnp.mean(total_loss, axis=-1),
+        }
+        return total_loss, stats
+
+    @override
+    def compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        loss, _ = self.compute_loss_with_stats(rng, observation, actions, train=train)
+        return loss
