@@ -3,10 +3,11 @@ import dataclasses
 import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
+import einops
 import flax.traverse_util as traverse_util
 import jax
-import torch
 import numpy as np
+import torch
 from openpi_client import image_tools
 
 from openpi.models import tokenizer as _tokenizer
@@ -216,6 +217,257 @@ class ResizeImages(DataTransformFn):
             if aux_image_key in data and data[aux_image_key] is not None:
                 data[aux_image_key] = image_tools.resize_with_pad(data[aux_image_key], self.height, self.width)
         return data
+
+
+class _RaftFlowEstimator:
+    def __init__(self, model_name: str, weights_name: str | None, device: str | None, pad_to_multiple: int):
+        try:
+            from torchvision.models.optical_flow import (
+                Raft_Large_Weights,
+                Raft_Small_Weights,
+                raft_large,
+                raft_small,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "RAFT optical flow requires torchvision. Run in the project's torch/uv environment."
+            ) from exc
+
+        self.pad_to_multiple = pad_to_multiple
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+        model_name = model_name.lower()
+        if model_name == "large":
+            weights_enum = Raft_Large_Weights
+            model_fn = raft_large
+        elif model_name == "small":
+            weights_enum = Raft_Small_Weights
+            model_fn = raft_small
+        else:
+            raise ValueError(f"Unsupported RAFT model_name: {model_name}. Use 'large' or 'small'.")
+
+        weights = self._resolve_weights(weights_enum, weights_name)
+        self.transforms = weights.transforms() if weights is not None else None
+        self.model = model_fn(weights=weights, progress=True).to(self.device).eval()
+
+    @staticmethod
+    def _resolve_weights(weights_enum, weights_name: str | None):
+        if weights_name is None:
+            return None
+        if isinstance(weights_name, str):
+            if weights_name.upper() == "DEFAULT":
+                return weights_enum.DEFAULT
+            return weights_enum[weights_name]
+        return weights_name
+
+    def _pad_pair(self, image_a: torch.Tensor, image_b: torch.Tensor):
+        height, width = image_a.shape[-2:]
+        pad_h = (self.pad_to_multiple - height % self.pad_to_multiple) % self.pad_to_multiple
+        pad_w = (self.pad_to_multiple - width % self.pad_to_multiple) % self.pad_to_multiple
+        if pad_h == 0 and pad_w == 0:
+            return image_a, image_b, height, width
+
+        pad = (0, pad_w, 0, pad_h)
+        image_a = torch.nn.functional.pad(image_a, pad, mode="replicate")
+        image_b = torch.nn.functional.pad(image_b, pad, mode="replicate")
+        return image_a, image_b, height, width
+
+    def _images_to_tensor(self, images: Sequence[np.ndarray]) -> torch.Tensor:
+        tensors = [torch.from_numpy(image).permute(2, 0, 1).contiguous() for image in images]
+        return torch.stack(tensors, dim=0)
+
+    def __call__(self, image_a: np.ndarray, image_b: np.ndarray) -> np.ndarray:
+        return self.batch([(image_a, image_b)])[0]
+
+    def batch(self, image_pairs: Sequence[tuple[np.ndarray, np.ndarray]]) -> list[np.ndarray]:
+        heights = [image_a.shape[0] for image_a, _ in image_pairs]
+        widths = [image_a.shape[1] for image_a, _ in image_pairs]
+        if len(set(heights)) != 1 or len(set(widths)) != 1:
+            return [self._call_single_old(image_a, image_b) for image_a, image_b in image_pairs]
+
+        image_as = [image_a for image_a, _ in image_pairs]
+        image_bs = [image_b for _, image_b in image_pairs]
+        tensor_a = self._images_to_tensor(image_as)
+        tensor_b = self._images_to_tensor(image_bs)
+
+        if self.transforms is not None:
+            tensor_a, tensor_b = self.transforms(tensor_a, tensor_b)
+        else:
+            tensor_a = tensor_a.float() / 127.5 - 1.0
+            tensor_b = tensor_b.float() / 127.5 - 1.0
+
+        tensor_a = tensor_a.to(self.device)
+        tensor_b = tensor_b.to(self.device)
+        tensor_a, tensor_b, height, width = self._pad_pair(tensor_a, tensor_b)
+
+        with torch.inference_mode():
+            flows = self.model(tensor_a, tensor_b)[-1][:, :, :height, :width]
+        return [
+            flow.permute(1, 2, 0).detach().cpu().numpy().astype(np.float32)
+            for flow in flows
+        ]
+
+    def _call_single_old(self, image_a: np.ndarray, image_b: np.ndarray) -> np.ndarray:
+        tensor_a = torch.from_numpy(image_a).permute(2, 0, 1).contiguous()
+        tensor_b = torch.from_numpy(image_b).permute(2, 0, 1).contiguous()
+
+        if self.transforms is not None:
+            tensor_a, tensor_b = self.transforms(tensor_a, tensor_b)
+        else:
+            tensor_a = tensor_a.float() / 127.5 - 1.0
+            tensor_b = tensor_b.float() / 127.5 - 1.0
+
+        tensor_a = tensor_a.unsqueeze(0).to(self.device)
+        tensor_b = tensor_b.unsqueeze(0).to(self.device)
+        tensor_a, tensor_b, height, width = self._pad_pair(tensor_a, tensor_b)
+
+        with torch.inference_mode():
+            flow = self.model(tensor_a, tensor_b)[-1][0, :, :height, :width]
+        return flow.permute(1, 2, 0).detach().cpu().numpy().astype(np.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class ComputeFutureOpticalFlowImages(DataTransformFn):
+    """Replace future RGB frames with raw dx/dy optical flow."""
+
+    image_keys: Sequence[str]
+    height: int = 224
+    width: int = 224
+    clip_flow: float | None = None
+    flow_method: str = "raft"
+    pyr_scale: float = 0.5
+    levels: int = 4
+    winsize: int = 10
+    iterations: int = 5
+    poly_n: int = 7
+    poly_sigma: float = 1.5
+    raft_model: str = "large"
+    raft_weights: str | None = "DEFAULT"
+    raft_device: str | None = None
+    raft_pad_to_multiple: int = 8
+    _raft_estimator: _RaftFlowEstimator | None = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if not data.get("future_image"):
+            return data
+
+        flow_images = {}
+        flow_masks = {}
+        future_masks = data.get("future_image_mask", {})
+        if self.flow_method.lower() == "raft":
+            prepared = []
+            for key in self.image_keys:
+                if key not in data["image"] or key not in data["future_image"]:
+                    continue
+                current, future = self._prepare_image_pair(data["image"][key], data["future_image"][key])
+                prepared.append((key, current, future))
+
+            if prepared:
+                shapes = {(current.shape[0], current.shape[1]) for _, current, _ in prepared}
+                if len(shapes) == 1:
+                    flows = self._raft().batch([(current, future) for _, current, future in prepared])
+                    for (key, _, _), flow in zip(prepared, flows, strict=True):
+                        if self.clip_flow is not None:
+                            flow = np.clip(flow, -float(self.clip_flow), float(self.clip_flow))
+                        flow_images[key] = self._resize_with_pad_float(flow).astype(np.float32)
+                        flow_masks[key] = future_masks.get(key, np.True_)
+                    data["future_image"] = flow_images
+                    data["future_image_mask"] = flow_masks
+                    return data
+
+        for key in self.image_keys:
+            if key not in data["image"] or key not in data["future_image"]:
+                continue
+            flow_images[key] = self._compute_flow(data["image"][key], data["future_image"][key])
+            flow_masks[key] = future_masks.get(key, np.True_)
+
+        if flow_images:
+            data["future_image"] = flow_images
+            data["future_image_mask"] = flow_masks
+        return data
+
+    def _to_uint8_hwc(self, image) -> np.ndarray:
+        image = np.asarray(image)
+        if image.ndim == 3 and image.shape[0] == 3:
+            image = einops.rearrange(image, "c h w -> h w c")
+        if np.issubdtype(image.dtype, np.floating):
+            if image.min() < 0:
+                image = (image + 1.0) / 2.0
+            image = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+        else:
+            image = image.astype(np.uint8)
+        return image
+
+    def _prepare_image_pair(self, current_image, future_image) -> tuple[np.ndarray, np.ndarray]:
+        import cv2
+
+        current = self._to_uint8_hwc(current_image)
+        future = self._to_uint8_hwc(future_image)
+        if current.shape[:2] != future.shape[:2]:
+            future = cv2.resize(future, (current.shape[1], current.shape[0]), interpolation=cv2.INTER_LINEAR)
+        return current, future
+
+    def _resize_with_pad_float(self, image: np.ndarray) -> np.ndarray:
+        import cv2
+
+        cur_height, cur_width = image.shape[:2]
+        ratio = max(cur_width / self.width, cur_height / self.height)
+        resized_height = int(cur_height / ratio)
+        resized_width = int(cur_width / ratio)
+        resized = cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+        if resized.ndim == 2:
+            resized = resized[..., None]
+
+        pad_h0, remainder_h = divmod(self.height - resized_height, 2)
+        pad_h1 = pad_h0 + remainder_h
+        pad_w0, remainder_w = divmod(self.width - resized_width, 2)
+        pad_w1 = pad_w0 + remainder_w
+        return np.pad(resized, ((pad_h0, pad_h1), (pad_w0, pad_w1), (0, 0)), constant_values=0.0)
+
+    def _compute_flow(self, current_image, future_image) -> np.ndarray:
+        import cv2
+
+        current, future = self._prepare_image_pair(current_image, future_image)
+
+        method = self.flow_method.lower()
+        if method == "raft":
+            flow = self._raft()(current, future)
+        elif method == "farneback":
+            gray_current = cv2.cvtColor(current, cv2.COLOR_RGB2GRAY)
+            gray_future = cv2.cvtColor(future, cv2.COLOR_RGB2GRAY)
+            flow = cv2.calcOpticalFlowFarneback(
+                gray_current,
+                gray_future,
+                None,
+                pyr_scale=self.pyr_scale,
+                levels=self.levels,
+                winsize=self.winsize,
+                iterations=self.iterations,
+                poly_n=self.poly_n,
+                poly_sigma=self.poly_sigma,
+                flags=0,
+            ).astype(np.float32)
+        else:
+            raise ValueError(f"Unsupported optical flow method: {self.flow_method}. Use 'raft' or 'farneback'.")
+        if self.clip_flow is not None:
+            flow = np.clip(flow, -float(self.clip_flow), float(self.clip_flow))
+        return self._resize_with_pad_float(flow).astype(np.float32)
+
+    def _raft(self) -> _RaftFlowEstimator:
+        if self._raft_estimator is None:
+            object.__setattr__(
+                self,
+                "_raft_estimator",
+                _RaftFlowEstimator(
+                    model_name=self.raft_model,
+                    weights_name=self.raft_weights,
+                    device=self.raft_device,
+                    pad_to_multiple=self.raft_pad_to_multiple,
+                ),
+            )
+        return self._raft_estimator
 
 
 @dataclasses.dataclass(frozen=True)
