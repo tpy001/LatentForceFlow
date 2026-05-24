@@ -215,7 +215,9 @@ def create_torch_dataset(
             for key in data_config.action_sequence_keys
         }
     } # 因为需要预测未来 action_horizon 步的 action，因此此处要设置 delta_timestamps，而不只是读取1帧
-    delta_timestamps["observation.effort"] = [t / dataset_meta.fps for t in data_config.effort_history] # 需要将过去 n 步 的 effort history 传入，注意，这里的 data_config.effort_history 必定是负的，例如,[-40,-36,-32...]
+    
+    if "observation.effort" in dataset_meta.features:
+        delta_timestamps["observation.effort"] = [t / dataset_meta.fps for t in data_config.effort_history] # 需要将过去 n 步 的 effort history 传入，注意，这里的 data_config.effort_history 必定是负的，例如,[-40,-36,-32...]
 
     if model_config.effort_type in (EffortType.EXPERT_FUT, EffortType.EXPERT_HIS_C_FUT, EffortType.EXPERT_HIS_C_L_FUT):
           # 如果需要预测未来的 effort 的话，就需要多往后读取 action_horizon 个 effort，因此此时 effort 的区间：[-effort_history, +action_horizon]
