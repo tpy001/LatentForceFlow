@@ -622,8 +622,8 @@ _CONFIGS = [
         # Here you define the model config -- In this example we use pi0 as the model
         # architecture and perform *full* finetuning. in the examples below we show how to modify
         # this to perform *low-memory* (LORA) finetuning and use pi0-FAST as an alternative architecture.
-        model=pi0_config.Pi0Config(),
-        # Here you define the dataset you are training on. In this example we use the Libero
+        model=pi0_config.Pi0Config(action_horizon=10),
+        # Here you define the dataset you are training odddn. In this example we use the Libero
         # dataset. For your own dataset, you can change the repo_id to point to your dataset.
         # Also modify the DataConfig to use the new config you made for your dataset above.
         data=LeRobotLiberoDataConfig(
@@ -634,7 +634,7 @@ _CONFIGS = [
                 # a field called ``prompt`` in the input dict. The recommended setting is True.
                 prompt_from_task=True,
             ),
-            extra_delta_transform=True,
+            extra_delta_transform=False, # The physical-intelligent/libero dataset already uses the delta action, so no additional transformation is needed.
         ),
         # Here you define which pre-trained checkpoint you want to load to initialize the model.
         # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
@@ -643,10 +643,9 @@ _CONFIGS = [
         # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
         # Check the base TrainConfig class for a full list of available hyperparameters.
         num_train_steps=30_000,
-        num_workers=8,
         save_interval=10000,
         keep_period=10000,
-        ema_decay=None,
+        # ema_decay=None, # 开启以节约显存
     ),
     TrainConfig(
         name="pi0_seer_0409",
@@ -684,7 +683,8 @@ _CONFIGS = [
             effort_dim=6,  # 6-axis force sensor
         ),
         data=LeRobotTaVLADataConfig(
-            repo_id="llly/all_0409", # Placeholder, replace with your actual repo_id
+            # repo_id="llly/all_0409", # Placeholder, replace with your actual repo_id
+            repo_id="llly/vga_0525", # Placeholder, replace with your actual repo_id
             effort_history=tuple((4*i-36 for i in range(10))), # sample 10 frames in 2s, assume fps =20
             base_config=DataConfig(
                 prompt_from_task=True,
