@@ -9,6 +9,7 @@ import pathlib
 from typing import Any
 
 import einops
+import imageio.v2 as imageio
 import imageio.v3 as iio
 import jax
 import jax.numpy as jnp
@@ -60,8 +61,20 @@ class Args:
     arrow_step: int = 10
     arrow_scale: float = 0.8
     arrow_thickness: int = 1
+    arrow_render_scale: int = 1
     arrow_min_magnitude: float = 1.5
-    arrow_color: tuple[int, int, int] = (0, 255, 255)
+    arrow_color: tuple[int, int, int] = (255, 0, 0)
+    highres_arrow_step: int = 24
+    highres_arrow_scale: float = 1.0
+    highres_arrow_thickness: int = 1
+    highres_arrow_render_scale: int = 3
+    highres_arrow_min_magnitude: float = 4.0
+    highres_video_width: int | None = None
+    highres_video_height: int | None = None
+    force_plot_font_size: int = 16
+    force_plot_legend_font_size: int = 13
+    force_plot_tick_font_size: int = 14
+    force_video_dpi: int = 140
     seed: int = 0
     num_workers: int = 0
     pretrained_params: str | None = None
@@ -137,22 +150,48 @@ def _flow_rgb_to_dxdy(flow_rgb: np.ndarray) -> np.ndarray:
     return np.stack([magnitude * np.cos(angle), magnitude * np.sin(angle)], axis=-1).astype(np.float32)
 
 
-def _draw_flow_arrows(
+def _resize_flow_rgb(flow_rgb: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    cv = _require_cv2()
+    target_height, target_width = target_shape
+    flow_uint8 = _to_numpy_image(flow_rgb)
+    if flow_uint8.shape[:2] == (target_height, target_width):
+        return flow_uint8
+    return cv.resize(flow_uint8, (target_width, target_height), interpolation=cv.INTER_LINEAR)
+
+
+def _flow_rgb_to_resized_dxdy(flow_rgb: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    return _flow_rgb_to_dxdy(_resize_flow_rgb(flow_rgb, target_shape))
+
+
+def _resize_rgb(rgb: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    cv = _require_cv2()
+    target_height, target_width = target_shape
+    if rgb.shape[:2] == (target_height, target_width):
+        return rgb
+    return cv.resize(rgb, (target_width, target_height), interpolation=cv.INTER_LINEAR)
+
+
+def _draw_dxdy_arrows(
     rgb: np.ndarray,
-    flow_rgb: np.ndarray,
+    flow: np.ndarray,
     *,
     step: int,
     scale: float,
     thickness: int,
+    render_scale: int,
     min_magnitude: float,
     color: tuple[int, int, int],
 ) -> np.ndarray:
     cv = _require_cv2()
     frame = rgb.copy()
-    flow = _flow_rgb_to_dxdy(flow_rgb)
     height, width = frame.shape[:2]
     if flow.shape[:2] != (height, width):
         flow = cv.resize(flow, (width, height), interpolation=cv.INTER_LINEAR)
+
+    render_scale = max(int(render_scale), 1)
+    draw_frame = frame
+    if render_scale > 1:
+        draw_frame = cv.resize(frame, (width * render_scale, height * render_scale), interpolation=cv.INTER_LINEAR)
 
     half = max(step // 2, 1)
     for y in range(half, height, step):
@@ -160,9 +199,38 @@ def _draw_flow_arrows(
             dx, dy = flow[y, x]
             if float(np.hypot(dx, dy)) < min_magnitude:
                 continue
-            end = (int(round(x + dx * scale)), int(round(y + dy * scale)))
-            cv.arrowedLine(frame, (x, y), end, color, thickness, line_type=cv.LINE_AA, tipLength=0.25)
-    return frame
+            start = (int(round(x * render_scale)), int(round(y * render_scale)))
+            end = (
+                int(round((x + dx * scale) * render_scale)),
+                int(round((y + dy * scale) * render_scale)),
+            )
+            cv.arrowedLine(draw_frame, start, end, color, thickness, line_type=cv.LINE_AA, tipLength=0.25)
+    if render_scale > 1:
+        return cv.resize(draw_frame, (width, height), interpolation=cv.INTER_AREA)
+    return draw_frame
+
+
+def _draw_flow_arrows(
+    rgb: np.ndarray,
+    flow_rgb: np.ndarray,
+    *,
+    step: int,
+    scale: float,
+    thickness: int,
+    render_scale: int,
+    min_magnitude: float,
+    color: tuple[int, int, int],
+) -> np.ndarray:
+    return _draw_dxdy_arrows(
+        rgb,
+        _flow_rgb_to_dxdy(flow_rgb),
+        step=step,
+        scale=scale,
+        thickness=thickness,
+        render_scale=render_scale,
+        min_magnitude=min_magnitude,
+        color=color,
+    )
 
 
 def _write_video(path: pathlib.Path, frames: list[np.ndarray], fps: float) -> None:
@@ -240,6 +308,66 @@ def _make_predict_fn(model_def, probe_def, infer_rng, probe_layer: int):
     return predict
 
 
+def _pred_curve_from_sum(pred_sum: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    valid = counts > 0
+    pred_curve = np.full_like(pred_sum, np.nan, dtype=np.float32)
+    pred_curve[valid] = pred_sum[valid] / counts[valid, None]
+    return pred_curve
+
+
+def _style_force_axis(
+    ax,
+    *,
+    font_size: int,
+    legend_font_size: int,
+    tick_font_size: int,
+) -> None:
+    ax.set_xlabel("episode time (s)", fontsize=font_size)
+    ax.set_ylabel("force", fontsize=font_size)
+    ax.tick_params(axis="both", labelsize=tick_font_size)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper right", ncol=2, fontsize=legend_font_size)
+
+
+def _plot_force_curves_on_axis(
+    ax,
+    x: np.ndarray,
+    true_curve: np.ndarray,
+    pred_curve: np.ndarray,
+    *,
+    end_index: int | None = None,
+) -> None:
+    dim = true_curve.shape[-1]
+    end_index = true_curve.shape[0] if end_index is None else max(1, min(end_index, true_curve.shape[0]))
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    for i in range(dim):
+        color = colors[i % len(colors)]
+        ax.plot(x[:end_index], true_curve[:end_index, i], label=f"F{i} true", color=color, linewidth=1.8)
+        ax.plot(
+            x[:end_index],
+            pred_curve[:end_index, i],
+            label=f"F{i} pred",
+            color=color,
+            linestyle="--",
+            linewidth=1.5,
+            alpha=0.9,
+        )
+
+
+def _force_axis_limits(true_curve: np.ndarray, pred_curve: np.ndarray) -> tuple[float, float]:
+    values = np.concatenate([true_curve.reshape(-1), pred_curve.reshape(-1)])
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return -1.0, 1.0
+    y_min = float(np.min(values))
+    y_max = float(np.max(values))
+    if y_min == y_max:
+        margin = max(abs(y_min) * 0.1, 1.0)
+    else:
+        margin = 0.08 * (y_max - y_min)
+    return y_min - margin, y_max + margin
+
+
 def _plot_force_comparison(
     output_path: pathlib.Path,
     true_curve: np.ndarray,
@@ -247,28 +375,139 @@ def _plot_force_comparison(
     counts: np.ndarray,
     *,
     fps: float,
+    font_size: int,
+    legend_font_size: int,
+    tick_font_size: int,
 ) -> None:
-    valid = counts > 0
-    pred_curve = np.full_like(pred_sum, np.nan, dtype=np.float32)
-    pred_curve[valid] = pred_sum[valid] / counts[valid, None]
-
-    dim = true_curve.shape[-1]
+    pred_curve = _pred_curve_from_sum(pred_sum, counts)
     x = np.arange(true_curve.shape[0]) / fps
-    fig, axes = plt.subplots(dim, 1, figsize=(12, max(2.0 * dim, 5.0)), sharex=True)
-    if dim == 1:
-        axes = [axes]
-    for i, ax in enumerate(axes):
-        ax.plot(x, true_curve[:, i], label="true", linewidth=1.5)
-        ax.plot(x, pred_curve[:, i], label="pred", linewidth=1.2, alpha=0.9)
-        ax.set_ylabel(f"F{i}")
-        ax.grid(True, alpha=0.25)
-        if i == 0:
-            ax.legend(loc="upper right")
-    axes[-1].set_xlabel("episode time (s)")
+    fig, ax = plt.subplots(1, 1, figsize=(14, 6))
+    _plot_force_curves_on_axis(ax, x, true_curve, pred_curve)
+    ax.set_xlim(float(x[0]), float(x[-1]) if x.size > 1 else 1.0)
+    ax.set_ylim(*_force_axis_limits(true_curve, pred_curve))
+    _style_force_axis(
+        ax,
+        font_size=font_size,
+        legend_font_size=legend_font_size,
+        tick_font_size=tick_font_size,
+    )
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
+
+
+def _render_force_frame(
+    x: np.ndarray,
+    true_curve: np.ndarray,
+    pred_curve: np.ndarray,
+    *,
+    end_index: int,
+    y_limits: tuple[float, float],
+    font_size: int,
+    legend_font_size: int,
+    tick_font_size: int,
+    dpi: int,
+) -> np.ndarray:
+    fig, ax = plt.subplots(1, 1, figsize=(14, 6), dpi=dpi)
+    _plot_force_curves_on_axis(ax, x, true_curve, pred_curve, end_index=end_index)
+    ax.set_xlim(float(x[0]), float(x[-1]) if x.size > 1 else 1.0)
+    ax.set_ylim(*y_limits)
+    _style_force_axis(
+        ax,
+        font_size=font_size,
+        legend_font_size=legend_font_size,
+        tick_font_size=tick_font_size,
+    )
+    fig.tight_layout()
+    fig.canvas.draw()
+    frame = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+    plt.close(fig)
+    return frame
+
+
+def _write_force_comparison_video(
+    output_path: pathlib.Path,
+    true_curve: np.ndarray,
+    pred_sum: np.ndarray,
+    counts: np.ndarray,
+    *,
+    fps: float,
+    font_size: int,
+    legend_font_size: int,
+    tick_font_size: int,
+    dpi: int,
+) -> None:
+    pred_curve = _pred_curve_from_sum(pred_sum, counts)
+    x = np.arange(true_curve.shape[0]) / fps
+    y_limits = _force_axis_limits(true_curve, pred_curve)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with imageio.get_writer(output_path, fps=fps, codec="libx264", macro_block_size=1) as writer:
+        for frame_idx in range(true_curve.shape[0]):
+            writer.append_data(
+                _render_force_frame(
+                    x,
+                    true_curve,
+                    pred_curve,
+                    end_index=frame_idx + 1,
+                    y_limits=y_limits,
+                    font_size=font_size,
+                    legend_font_size=legend_font_size,
+                    tick_font_size=tick_font_size,
+                    dpi=dpi,
+                )
+            )
+
+
+def _resize_to_width(image: np.ndarray, width: int) -> np.ndarray:
+    cv = _require_cv2()
+    height = image.shape[0]
+    if image.shape[1] == width:
+        return image
+    resized_height = max(1, int(round(height * width / image.shape[1])))
+    return cv.resize(image, (width, resized_height), interpolation=cv.INTER_AREA)
+
+
+def _write_combined_flow_force_video(
+    output_path: pathlib.Path,
+    flow_frames: list[np.ndarray],
+    true_curve: np.ndarray,
+    pred_sum: np.ndarray,
+    counts: np.ndarray,
+    *,
+    fps: float,
+    font_size: int,
+    legend_font_size: int,
+    tick_font_size: int,
+    dpi: int,
+) -> None:
+    pred_curve = _pred_curve_from_sum(pred_sum, counts)
+    x = np.arange(true_curve.shape[0]) / fps
+    y_limits = _force_axis_limits(true_curve, pred_curve)
+    frame_count = min(len(flow_frames), true_curve.shape[0])
+    if frame_count == 0:
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    target_width = int(flow_frames[0].shape[1])
+    with imageio.get_writer(output_path, fps=fps, codec="libx264", macro_block_size=1) as writer:
+        for frame_idx in range(frame_count):
+            flow_frame = flow_frames[frame_idx]
+            if flow_frame.shape[1] != target_width:
+                flow_frame = _resize_to_width(flow_frame, target_width)
+            force_frame = _render_force_frame(
+                x,
+                true_curve,
+                pred_curve,
+                end_index=frame_idx + 1,
+                y_limits=y_limits,
+                font_size=font_size,
+                legend_font_size=legend_font_size,
+                tick_font_size=tick_font_size,
+                dpi=dpi,
+            )
+            force_frame = _resize_to_width(force_frame, target_width)
+            writer.append_data(np.concatenate([flow_frame, force_frame], axis=0))
 
 
 def _prediction_starts(frame_count: int, horizon: int, stride: int) -> list[int]:
@@ -287,6 +526,10 @@ def main(args: Args) -> None:
         raise ValueError("--predict-stride must be positive.")
     if args.video_size <= 0:
         raise ValueError("--video-size must be positive.")
+    if (args.highres_video_width is None) != (args.highres_video_height is None):
+        raise ValueError("--highres-video-width and --highres-video-height must be set together.")
+    if args.highres_video_width is not None and (args.highres_video_width <= 0 or args.highres_video_height <= 0):
+        raise ValueError("--highres-video-width and --highres-video-height must be positive.")
 
     lr_dataset = _require_lerobot_dataset()
     raw_dataset = lr_dataset.LeRobotDataset(args.repo_id)
@@ -322,6 +565,7 @@ def main(args: Args) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     original_frames: list[np.ndarray] = []
     arrow_frames: list[np.ndarray] = []
+    highres_arrow_frames: list[np.ndarray] = []
     latest_flow_rgb: np.ndarray | None = None
 
     effort_dim = int(config.model.effort_dim if config.model.effort_dim is not None else config.model.effort_dim_in)
@@ -335,8 +579,8 @@ def main(args: Args) -> None:
         raw_sample = raw_dataset[global_idx]
         if args.video_key not in raw_sample:
             raise KeyError(f"Video key {args.video_key!r} not found in dataset sample.")
-        rgb = _to_numpy_image(raw_sample[args.video_key])
-        rgb = image_tools.resize_with_pad(rgb, args.video_size, args.video_size)
+        raw_rgb = _to_numpy_image(raw_sample[args.video_key])
+        rgb = image_tools.resize_with_pad(raw_rgb, args.video_size, args.video_size)
         if "observation.effort" in raw_sample:
             raw_effort = _to_numpy(raw_sample["observation.effort"]).astype(np.float64)
             true_curve[local_idx] = raw_effort[:effort_dim]
@@ -362,6 +606,12 @@ def main(args: Args) -> None:
         original_frames.append(rgb)
         if latest_flow_rgb is None:
             arrow_frames.append(rgb)
+            highres_shape = (
+                int(args.highres_video_height or raw_rgb.shape[0]),
+                int(args.highres_video_width or raw_rgb.shape[1]),
+            )
+            highres_rgb = _resize_rgb(raw_rgb, highres_shape)
+            highres_arrow_frames.append(highres_rgb)
         else:
             arrow_frames.append(
                 _draw_flow_arrows(
@@ -370,17 +620,72 @@ def main(args: Args) -> None:
                     step=args.arrow_step,
                     scale=args.arrow_scale,
                     thickness=args.arrow_thickness,
+                    render_scale=args.arrow_render_scale,
                     min_magnitude=args.arrow_min_magnitude,
+                    color=args.arrow_color,
+                )
+            )
+            highres_shape = (
+                int(args.highres_video_height or raw_rgb.shape[0]),
+                int(args.highres_video_width or raw_rgb.shape[1]),
+            )
+            highres_rgb = _resize_rgb(raw_rgb, highres_shape)
+            highres_flow = _flow_rgb_to_resized_dxdy(latest_flow_rgb, highres_shape)
+            highres_arrow_frames.append(
+                _draw_dxdy_arrows(
+                    highres_rgb,
+                    highres_flow,
+                    step=args.highres_arrow_step,
+                    scale=args.highres_arrow_scale,
+                    thickness=args.highres_arrow_thickness,
+                    render_scale=args.highres_arrow_render_scale,
+                    min_magnitude=args.highres_arrow_min_magnitude,
                     color=args.arrow_color,
                 )
             )
 
     original_path = output_dir / "rgb_video.mp4"
     arrow_path = output_dir / "rgb_with_pred_flow_arrows.mp4"
+    highres_arrow_path = output_dir / "rgb_with_pred_flow_arrows_highres.mp4"
     figure_path = output_dir / "force_prediction_vs_true.png"
+    force_video_path = output_dir / "force_prediction_vs_true.mp4"
+    combined_video_path = output_dir / "rgb_flow_highres_with_force.mp4"
     _write_video(original_path, original_frames, fps)
     _write_video(arrow_path, arrow_frames, fps)
-    _plot_force_comparison(figure_path, true_curve, pred_sum, counts, fps=fps)
+    _write_video(highres_arrow_path, highres_arrow_frames, fps)
+    _plot_force_comparison(
+        figure_path,
+        true_curve,
+        pred_sum,
+        counts,
+        fps=fps,
+        font_size=args.force_plot_font_size,
+        legend_font_size=args.force_plot_legend_font_size,
+        tick_font_size=args.force_plot_tick_font_size,
+    )
+    _write_force_comparison_video(
+        force_video_path,
+        true_curve,
+        pred_sum,
+        counts,
+        fps=fps,
+        font_size=args.force_plot_font_size,
+        legend_font_size=args.force_plot_legend_font_size,
+        tick_font_size=args.force_plot_tick_font_size,
+        dpi=args.force_video_dpi,
+    )
+    _write_combined_flow_force_video(
+        combined_video_path,
+        highres_arrow_frames,
+        true_curve,
+        pred_sum,
+        counts,
+        fps=fps,
+        font_size=args.force_plot_font_size,
+        legend_font_size=args.force_plot_legend_font_size,
+        tick_font_size=args.force_plot_tick_font_size,
+        dpi=args.force_video_dpi,
+    )
 
     np.savez(
         output_dir / "force_prediction_vs_true.npz",
@@ -403,13 +708,19 @@ def main(args: Args) -> None:
         "outputs": {
             "rgb_video": str(original_path),
             "rgb_with_pred_flow_arrows": str(arrow_path),
+            "rgb_with_pred_flow_arrows_highres": str(highres_arrow_path),
             "force_figure": str(figure_path),
+            "force_video": str(force_video_path),
+            "rgb_flow_highres_with_force": str(combined_video_path),
         },
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata_payload, indent=2), encoding="utf-8")
     logging.info("Saved RGB video: %s", original_path)
     logging.info("Saved flow-arrow video: %s", arrow_path)
+    logging.info("Saved high-res flow-arrow video: %s", highres_arrow_path)
     logging.info("Saved force figure: %s", figure_path)
+    logging.info("Saved force video: %s", force_video_path)
+    logging.info("Saved combined flow-force video: %s", combined_video_path)
 
 
 if __name__ == "__main__":

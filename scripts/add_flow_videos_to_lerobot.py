@@ -5,8 +5,8 @@ Expected source layout, produced by scripts/flow_cache_to_videos.py:
     FLOW_VIDEOS_DIR/left_wrist_0_rgb/episode_000072.mp4
 
 Target LeRobot layout:
-    DATASET_ROOT/videos/chunk-000/observation.future_flow.base_0_rgb/episode_000072.mp4
-    DATASET_ROOT/videos/chunk-000/observation.future_flow.left_wrist_0_rgb/episode_000072.mp4
+    ~/.cache/huggingface/lerobot/REPO_ID/videos/chunk-000/observation.future_flow.base_0_rgb/episode_000072.mp4
+    ~/.cache/huggingface/lerobot/REPO_ID/videos/chunk-000/observation.future_flow.left_wrist_0_rgb/episode_000072.mp4
 
 The script updates meta/info.json so LeRobot can discover the new video keys.
 It does not rewrite parquet files: LeRobot v2 decodes video features from
@@ -16,6 +16,7 @@ meta.video_keys, timestamps, and the video_path template.
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import pathlib
 import re
@@ -24,10 +25,6 @@ import subprocess
 from typing import Any
 
 
-DEFAULT_DATASET_ROOT = pathlib.Path("~/.cache/huggingface/lerobot/tpy/forge_all_0413").expanduser()
-DEFAULT_FLOW_VIDEOS_DIR = pathlib.Path(
-    "/ext_workspace/tpy/code/ustc_openpi_clean/forge_all_0413/videos"
-)
 DEFAULT_STREAM_TO_FEATURE = {
     "base_0_rgb": "observation.future_flow.base_0_rgb",
     "left_wrist_0_rgb": "observation.future_flow.left_wrist_0_rgb",
@@ -69,6 +66,20 @@ def parse_stream_map(items: list[str] | None) -> dict[str, str]:
             raise ValueError(f"Expected non-empty STREAM=FEATURE_KEY, got {item!r}")
         stream_map[stream] = feature_key
     return stream_map
+
+
+def default_lerobot_home() -> pathlib.Path:
+    return pathlib.Path(
+        os.environ.get("HF_LEROBOT_HOME")
+        or os.environ.get("LEROBOT_HOME")
+        or pathlib.Path.home() / ".cache" / "huggingface" / "lerobot"
+    )
+
+
+def resolve_dataset_root(repo_id: str, dataset_root: pathlib.Path | None) -> pathlib.Path:
+    if dataset_root is not None:
+        return dataset_root.expanduser().resolve()
+    return (default_lerobot_home() / repo_id).expanduser().resolve()
 
 
 def probe_video_info(video_path: pathlib.Path, fallback_fps: int | float) -> tuple[list[int], dict[str, Any]]:
@@ -176,8 +187,19 @@ def add_feature(info: dict[str, Any], feature_key: str, shape: list[int], video_
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-root", type=pathlib.Path, default=DEFAULT_DATASET_ROOT)
-    parser.add_argument("--flow-videos-dir", type=pathlib.Path, default=DEFAULT_FLOW_VIDEOS_DIR)
+    parser.add_argument("--repo-id", "--repo_id", dest="repo_id", required=True, help="LeRobot dataset repo id.")
+    parser.add_argument(
+        "--dataset-root",
+        type=pathlib.Path,
+        default=None,
+        help="Optional explicit dataset root. Defaults to $HF_LEROBOT_HOME/REPO_ID or ~/.cache/huggingface/lerobot/REPO_ID.",
+    )
+    parser.add_argument(
+        "--flow-videos-dir",
+        type=pathlib.Path,
+        required=True,
+        help="Flow video directory containing per-stream episode mp4 files.",
+    )
     parser.add_argument(
         "--map",
         nargs="*",
@@ -194,7 +216,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Print planned changes without writing files.")
     args = parser.parse_args()
 
-    dataset_root = args.dataset_root.expanduser().resolve()
+    dataset_root = resolve_dataset_root(args.repo_id, args.dataset_root)
     flow_videos_dir = args.flow_videos_dir.expanduser().resolve()
     info_path = dataset_root / "meta" / "info.json"
     if not info_path.exists():
