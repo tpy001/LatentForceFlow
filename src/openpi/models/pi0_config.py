@@ -262,3 +262,33 @@ class Pi0LatentFlowConfig(Pi0Config):
     def create(self, rng: at.KeyArrayLike) -> "Pi0":
         from openpi.models.pi0_latent_flow import Pi0LatentFlow
         return Pi0LatentFlow(self, rngs=nnx.Rngs(rng))
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
+    flow_teacher_expert_variant: _gemma.Variant = "gemma_300m"
+    depth_teacher_expert_variant: _gemma.Variant = "gemma_300m"
+    flow_teacher_action_loss_weight: float = 1.0
+    depth_teacher_action_loss_weight: float = 1.0
+    future_depth_align_loss_weight: float = 0.1
+    depth_token_count: int = 16
+    depth_distill_projector_hidden_dim: int | None = None
+
+    @override
+    def __post_init__(self):
+        super().__post_init__()
+        if self.flow_token_count <= 0:
+            raise ValueError(f"flow_token_count must be positive, got {self.flow_token_count}.")
+        if self.depth_token_count <= 0:
+            raise ValueError(f"depth_token_count must be positive, got {self.depth_token_count}.")
+        if self.future_depth_align_loss_weight < 0.0:
+            raise ValueError(
+                "future_depth_align_loss_weight must be non-negative, "
+                f"got {self.future_depth_align_loss_weight}."
+            )
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0":
+        from openpi.models.pi0_latent_flow_depth_teachers import Pi0LatentFlowDepthTeachers
+
+        return Pi0LatentFlowDepthTeachers(self, rngs=nnx.Rngs(rng))

@@ -84,6 +84,17 @@ class LiberoInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class LiberoFlowDepthInputs(LiberoInputs):
+    def __call__(self, data: dict) -> dict:
+        inputs = super().__call__(data)
+        inputs["flow_img"] = _parse_image(data["observation/flow_image"])
+        inputs["wrist_flow_img"] = _parse_image(data["observation/flow_wrist_image"])
+        inputs["depth_img"] = _parse_image(data["observation/depth_image"])
+        inputs["wrist_depth_img"] = _parse_image(data["observation/depth_wrist_image"])
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
 class LiberoOutputs(transforms.DataTransformFn):
     """
     This class is used to convert outputs from the model back the the dataset specific format. It is

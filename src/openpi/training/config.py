@@ -287,6 +287,50 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotLiberoFlowDepthDataConfig(LeRobotLiberoDataConfig):
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/flow_image": "flow_image",
+                        "observation/flow_wrist_image": "flow_wrist_image",
+                        "observation/depth_image": "depth_image",
+                        "observation/depth_wrist_image": "depth_wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoFlowDepthInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotYuanluoDataConfig(DataConfigFactory):
@@ -648,6 +692,34 @@ _CONFIGS = [
         # ema_decay=None, # 开启以节约显存
     ),
     TrainConfig(
+        name="pi0_latent_flow_depth_teachers_libero",
+        model=pi0_config.Pi0LatentFlowDepthTeachersConfig(
+            action_horizon=10,
+            effort_type=EffortType.NO,
+            effort_dim=None,
+            future_force_align_loss_weight=0.0,
+            future_flow_align_loss_weight=1.0,
+            future_depth_align_loss_weight=1.0,
+            flow_token_count=16,
+            depth_token_count=16,
+            student_future_query_noise_scale_max=0.3,
+            student_future_query_noise_start_ratio=0.3,
+            student_future_query_noise_end_ratio=0.7,
+            use_future_rgb_instead_of_flow=False,
+        ),
+        data=LeRobotLiberoFlowDepthDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        save_interval=10000,
+        keep_period=10000,
+    ),
+    TrainConfig(
         name="pi0_seer_0409",
         model=pi0_config.Pi0SeerConfig(
             action_horizon=32,
@@ -808,7 +880,8 @@ _CONFIGS = [
             use_future_rgb_instead_of_flow = False
         ),
         data=LeRobotOptimalFlowDataConfig(
-            repo_id="llly/all_0409_stage_flow", # Placeholder, replace with your actual repo_id
+            repo_id="llly/vga_0525_flow", # Placeholder, replace with your actual repo_id
+            # repo_id="llly/all_0409_stage_flow", # Placeholder, replace with your actual repo_id
             effort_history=tuple(list((4 * i - 36 for i in range(10))) + list(range(1, 33))),
             base_config=DataConfig(
                 prompt_from_task=True,
