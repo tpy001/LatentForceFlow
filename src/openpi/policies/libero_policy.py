@@ -87,10 +87,14 @@ class LiberoInputs(transforms.DataTransformFn):
 class LiberoFlowDepthInputs(LiberoInputs):
     def __call__(self, data: dict) -> dict:
         inputs = super().__call__(data)
-        inputs["flow_img"] = _parse_image(data["observation/flow_image"])
-        inputs["wrist_flow_img"] = _parse_image(data["observation/flow_wrist_image"])
-        inputs["depth_img"] = _parse_image(data["observation/depth_image"])
-        inputs["wrist_depth_img"] = _parse_image(data["observation/depth_wrist_image"])
+        if "observation/flow_image" in data.keys():
+            inputs["flow_img"] = _parse_image(data["observation/flow_image"])
+        if "observation/flow_wrist_image" in data.keys():
+            inputs["wrist_flow_img"] = _parse_image(data["observation/flow_wrist_image"])
+        if "observation/depth_image" in data.keys():
+            inputs["depth_img"] = _parse_image(data["observation/depth_image"])
+        if "observation/depth_wrist_image" in data.keys():
+            inputs["wrist_depth_img"] = _parse_image(data["observation/depth_wrist_image"])
         return inputs
 
 

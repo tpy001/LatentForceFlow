@@ -1,0 +1,11 @@
+CUDA_VISIBLE_DEVICES=5  uv run python scripts/compute_lerobot_depth_video.py \
+  --repo-id physical-intelligence/libero \
+  --output-dir depth_videos \
+  --image-keys image wrist_image \
+  --stream-names image wrist_image \
+  --model depth-anything/Depth-Anything-V2-Base-hf \
+  --device cuda \
+  --dtype auto \
+  --video-backend torchcodec \
+  --colormap turbo \
+  --overwrite

@@ -28,10 +28,25 @@ def _merge_params_with_defaults(defaults: at.Params, loaded: at.Params) -> at.Pa
     """Fills missing leaves in loaded params with the current model initialization."""
     if isinstance(defaults, dict) and isinstance(loaded, Mapping):
         return {
-            key: _merge_params_with_defaults(default_value, loaded[key]) if key in loaded else default_value
+            key: _merge_params_with_defaults(default_value, loaded[key])
+            if key in loaded
+            else _materialize_param_default(default_value)
             for key, default_value in defaults.items()
         }
     return loaded
+
+
+def _materialize_param_default(default: at.Params) -> at.Params:
+    if isinstance(default, dict):
+        return {key: _materialize_param_default(value) for key, value in default.items()}
+    if isinstance(default, jax.ShapeDtypeStruct):
+        return jnp.zeros(default.shape, default.dtype)
+    return default
+
+
+def _missing_param_paths(expected: at.Params, loaded: at.Params) -> list[tuple[str, ...]]:
+    loaded_paths = set(traverse_util.flatten_dict(loaded))
+    return [path for path in traverse_util.flatten_dict(expected) if path not in loaded_paths]
 
 # Type variable for array types (JAX arrays, PyTorch tensors, or numpy arrays)
 ArrayT = TypeVar("ArrayT", bound=jax.Array | torch.Tensor | np.ndarray)
@@ -271,17 +286,17 @@ def preprocess_observation(
         image_masks=out_masks,
         state=state,
         effort=effort,
-        flow_img=observation.flow_img,
-        wrist_flow_img=observation.wrist_flow_img,
-        depth_img=observation.depth_img,
-        wrist_depth_img=observation.wrist_depth_img,
-        future_rgb_img=observation.future_rgb_img,
-        future_wrist_rgb_img=observation.future_wrist_rgb_img,
+        flow_img= observation.flow_img if hasattr(observation, "flow_img") else None,
+        wrist_flow_img=observation.wrist_flow_img if hasattr(observation, "wrist_flow_img") else None,
+        depth_img=observation.depth_img if hasattr(observation, "depth_img") else None,
+        wrist_depth_img=observation.wrist_depth_img if hasattr(observation, "wrist_depth_img") else None,
+        future_rgb_img=observation.future_rgb_img if hasattr(observation, "future_rgb_img") else None,
+        future_wrist_rgb_img=observation.future_wrist_rgb_img if hasattr(observation, "future_wrist_rgb_img") else None,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
-        is_contact=observation.is_contact,
+        is_contact=observation.is_contact if hasattr(observation, "is_contact") else None,
     )
 
 
@@ -314,6 +329,13 @@ class BaseModelConfig(abc.ABC):
         expected_params = state.to_pure_dict()
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(expected_params, params)
+        missing_paths = _missing_param_paths(expected_params, params)
+        if missing_paths:
+            logger.warning(
+                "Checkpoint is missing %d parameter leaves; using default zero initialization for:\n%s",
+                len(missing_paths),
+                "\n".join(f"  - {'/'.join(path)}" for path in missing_paths),
+            )
         params = _merge_params_with_defaults(expected_params, params)
         at.check_pytree_equality(expected=expected_params, got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
@@ -408,6 +430,5 @@ def restore_params(
     # If the params were saved with `save_state` during openpi training, every key path will end with "value", which is
     # added by `nnx.State`. We remove the "value" suffix here and always return what NNX calls a "pure dict".
     flat_params = traverse_util.flatten_dict(params)
-    if all(kp[-1] == "value" for kp in flat_params):
-        flat_params = {kp[:-1]: v for kp, v in flat_params.items()}
+    flat_params = {kp[:-1] if kp[-1] == "value" else kp: v for kp, v in flat_params.items()}
     return traverse_util.unflatten_dict(flat_params)

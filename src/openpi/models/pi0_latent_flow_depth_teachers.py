@@ -29,9 +29,9 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         self.flow_token_count = int(config.flow_token_count)
         self.depth_token_count = int(config.depth_token_count)
         self.future_visual_channels = 3
-        self.flow_vae_name = getattr(config, "flow_vae_name", "stabilityai/sdxl-vae")
-        self.flow_vae, flow_vae_params = _get_flow_vae(self.flow_vae_name)
-        self.flow_vae_params = nnx.Variable(flow_vae_params)
+        # self.flow_vae_name = getattr(config, "flow_vae_name", "stabilityai/sdxl-vae")
+        # self.flow_vae, flow_vae_params = _get_flow_vae(self.flow_vae_name)
+        # self.flow_vae_params = nnx.Variable(flow_vae_params)
         self.student_future_query_noise_scale_max = float(config.student_future_query_noise_scale_max)
         self.student_future_query_noise_start_ratio = float(config.student_future_query_noise_start_ratio)
         self.student_future_query_noise_end_ratio = float(config.student_future_query_noise_end_ratio)
@@ -552,7 +552,6 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
     def sample_actions(self, rng, observation, *, num_steps=10, noise=None, debug_query_noise_scale=None):
         original_observation = observation
         observation = _model.preprocess_observation(None, observation, train=False, effort_type=self.effort_type)
-        observation = self._restore_aux_images(observation, original_observation)
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
         action_noise_rng, query_noise_rng = jax.random.split(rng)

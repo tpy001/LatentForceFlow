@@ -89,10 +89,10 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
         
-        if "effort" in inputs.keys():
-            observation = _model_tavla.Observation.from_dict(inputs)
-        else:
-            observation = _model.Observation.from_dict(inputs)
+        # if "effort" in inputs.keys():
+        observation = _model_tavla.Observation.from_dict(inputs)
+        # else:
+            # observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],
