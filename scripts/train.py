@@ -138,13 +138,11 @@ def _load_weights_and_validate(loader, params_shape):
 
 def _preload_model_assets(config: _config.TrainConfig) -> None:
     flow_vae_name = getattr(config.model, "flow_vae_name", None)
-    if flow_vae_name is None:
-        return
+    if flow_vae_name is not None:
+        from openpi.models.pi0_latent_flow import preload_flow_vae
 
-    from openpi.models.pi0_latent_flow import preload_flow_vae
-
-    logging.info("Preloading flow VAE '%s' before model initialization.", flow_vae_name)
-    preload_flow_vae(flow_vae_name)
+        logging.info("Preloading flow VAE '%s' before model initialization.", flow_vae_name)
+        preload_flow_vae(flow_vae_name)
 
 
 @at.typecheck

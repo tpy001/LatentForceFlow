@@ -52,6 +52,7 @@ class CheckpointWeightLoader(WeightLoader):
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
         loaded_params = _augment_with_moe_shared_ffn_weights(loaded_params, params)
         loaded_params = _augment_with_mor_action_expert_weights(loaded_params, params)
+        loaded_params = _augment_with_flow_depth_teacher_action_weights(loaded_params, params)
         # Add all missing LoRA weights.
         return _merge_params(loaded_params, params, missing_regex=".*lora.*")
 
@@ -144,34 +145,101 @@ def _augment_with_moe_shared_ffn_weights(loaded_params: at.Params, params: at.Pa
 
 
 def _augment_with_mor_action_expert_weights(loaded_params: at.Params, params: at.Params) -> at.Params:
-    """Copies action-expert (_1) checkpoint tensors into MOR refine-expert (_2) slots.
+    """Copies action-expert (_1) checkpoint tensors into extra action-expert slots.
 
-    This is useful when loading a 2-expert pi0 checkpoint into a 3-expert MOR model:
+    This is useful when loading a 2-expert pi0 checkpoint into models with extra action experts:
       .../attn_1/...       -> .../attn_2/...
+      .../attn_1/...       -> .../attn_3/...
       .../mlp_1/...        -> .../mlp_2/...
       .../final_norm_1/... -> .../final_norm_2/...
     """
     flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
     flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
     augmented = dict(flat_loaded)
+    target_suffixes = sorted(
+        {
+            int(match.group(1))
+            for key in flat_ref
+            for part in key.split("/")
+            if (match := re.fullmatch(r".*_(\d+)", part)) is not None and int(match.group(1)) > 1
+        }
+    )
 
     copied = 0
     for k, v in flat_loaded.items():
         parts = k.split("/")
-        mapped_parts = [part[:-2] + "_2" if part.endswith("_1") else part for part in parts]
-        mapped_key = "/".join(mapped_parts)
-        if mapped_key == k:
+        if not any(part.endswith("_1") for part in parts):
             continue
-        if mapped_key in augmented:
-            continue
-        if mapped_key not in flat_ref:
-            continue
-        if hasattr(v, "shape") and hasattr(flat_ref[mapped_key], "shape") and v.shape != flat_ref[mapped_key].shape:
-            continue
-        augmented[mapped_key] = v.astype(flat_ref[mapped_key].dtype) if v.dtype != flat_ref[mapped_key].dtype else v
-        copied += 1
+        for target_suffix in target_suffixes:
+            mapped_parts = [
+                part[:-2] + f"_{target_suffix}" if part.endswith("_1") else part
+                for part in parts
+            ]
+            mapped_key = "/".join(mapped_parts)
+            if mapped_key == k:
+                continue
+            if mapped_key in augmented:
+                continue
+            if mapped_key not in flat_ref:
+                continue
+            if hasattr(v, "shape") and hasattr(flat_ref[mapped_key], "shape") and v.shape != flat_ref[mapped_key].shape:
+                continue
+            augmented[mapped_key] = v.astype(flat_ref[mapped_key].dtype) if v.dtype != flat_ref[mapped_key].dtype else v
+            copied += 1
 
     if copied > 0:
-        logger.info("Mapped %d tensors from action expert (_1) to MOR refine expert (_2).", copied)
+        logger.info("Mapped %d tensors from action expert (_1) to extra action experts.", copied)
+
+    return flax.traverse_util.unflatten_dict(augmented, sep="/")
+
+
+def _augment_with_flow_depth_teacher_action_weights(loaded_params: at.Params, params: at.Params) -> at.Params:
+    """Copies reusable pi0/pi0_latent_flow action-path weights into flow/depth teacher slots."""
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+    augmented = dict(flat_loaded)
+
+    mappings = {
+        "state_proj_student": ("state_proj_student", "state_proj"),
+        "state_proj_flow_teacher": ("state_proj_teacher", "state_proj"),
+        "state_proj_depth_teacher": ("state_proj_teacher", "state_proj"),
+        "action_in_proj_student": ("action_in_proj_student", "action_in_proj"),
+        "action_in_proj_flow_teacher": ("action_in_proj_teacher", "action_in_proj"),
+        "action_in_proj_depth_teacher": ("action_in_proj_teacher", "action_in_proj"),
+        "action_out_proj_student": ("action_out_proj_student", "action_out_proj"),
+        "action_out_proj_flow_teacher": ("action_out_proj_teacher", "action_out_proj"),
+        "action_out_proj_depth_teacher": ("action_out_proj_teacher", "action_out_proj"),
+        "student_time_mlp_in": ("student_time_mlp_in", "action_time_mlp_in", "time_mlp_in"),
+        "student_time_mlp_out": ("student_time_mlp_out", "action_time_mlp_out", "time_mlp_out"),
+        "flow_teacher_time_mlp_in": ("teacher_time_mlp_in", "action_time_mlp_in", "time_mlp_in"),
+        "flow_teacher_time_mlp_out": ("teacher_time_mlp_out", "action_time_mlp_out", "time_mlp_out"),
+        "depth_teacher_time_mlp_in": ("teacher_time_mlp_in", "action_time_mlp_in", "time_mlp_in"),
+        "depth_teacher_time_mlp_out": ("teacher_time_mlp_out", "action_time_mlp_out", "time_mlp_out"),
+    }
+
+    copied = 0
+    for target_module, source_modules in mappings.items():
+        for suffix in ("kernel", "bias"):
+            target_key = f"{target_module}/{suffix}"
+            if target_key in augmented or target_key not in flat_ref:
+                continue
+            for source_module in source_modules:
+                source_key = f"{source_module}/{suffix}"
+                if source_key not in flat_loaded:
+                    continue
+                source_value = flat_loaded[source_key]
+                if hasattr(source_value, "shape") and hasattr(flat_ref[target_key], "shape"):
+                    if source_value.shape != flat_ref[target_key].shape:
+                        continue
+                augmented[target_key] = (
+                    source_value.astype(flat_ref[target_key].dtype)
+                    if source_value.dtype != flat_ref[target_key].dtype
+                    else source_value
+                )
+                copied += 1
+                break
+
+    if copied > 0:
+        logger.info("Mapped %d reusable action-path tensors into flow/depth teacher model.", copied)
 
     return flax.traverse_util.unflatten_dict(augmented, sep="/")

@@ -223,6 +223,10 @@ def create_torch_dataset(
           # 如果需要预测未来的 effort 的话，就需要多往后读取 action_horizon 个 effort，因此此时 effort 的区间：[-effort_history, +action_horizon]
           delta_timestamps["observation.effort"] += [(t + 1) / dataset_meta.fps for t in range(model_config.action_horizon)]
 
+    if isinstance(model_config, pi0_config.Pi0LatentFlowDepthTeachersConfig):
+        delta_timestamps["depth_image"] = [model_config.action_horizon / dataset_meta.fps]
+        delta_timestamps["depth_wrist_image"] = [model_config.action_horizon / dataset_meta.fps]
+
     if (
         isinstance(model_config, (pi0_config.Pi0LatentFlowConfig, pi0_config.Pi0SeerConfig))
         and model_config.use_future_rgb_instead_of_flow

@@ -357,11 +357,11 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         )
         flow_prefix = suffix_to_prefix(
             flow_mask,
-            jnp.array([False] + ([False] * self.flow_token_count) + ([True] * self.action_horizon)),
+            jnp.array([True] + ([True] * self.flow_token_count) + ([True] * self.action_horizon)),
         )
         depth_prefix = suffix_to_prefix(
             depth_mask,
-            jnp.array([False] + ([False] * self.depth_token_count) + ([True] * self.action_horizon)),
+            jnp.array([True] + ([True] * self.depth_token_count) + ([True] * self.action_horizon)),
         )
 
         prefix_row = jnp.concatenate(
