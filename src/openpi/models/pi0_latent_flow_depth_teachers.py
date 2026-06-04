@@ -46,6 +46,9 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         self.depth_teacher_action_loss_weight = float(config.depth_teacher_action_loss_weight)
         self.future_flow_align_loss_weight = float(config.future_flow_align_loss_weight)
         self.future_depth_align_loss_weight = float(config.future_depth_align_loss_weight)
+        self.future_flow_contrast_loss_weight = float(config.future_flow_contrast_loss_weight)
+        self.future_depth_contrast_loss_weight = float(config.future_depth_contrast_loss_weight)
+        self.distill_contrast_temperature = float(config.distill_contrast_temperature)
         self.flow_token_count = int(config.flow_token_count)
         self.depth_token_count = int(config.depth_token_count)
         self.future_visual_channels = 3
@@ -455,6 +458,25 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         denom = jnp.maximum(jnp.sum(weights, axis=-1), jnp.asarray(1.0, dtype=losses.dtype))
         return jnp.sum(losses * weights, axis=-1) / denom
 
+    @staticmethod
+    def _tokenwise_contrastive_cosine_loss(student, teacher, token_mask, temperature: float):
+        student = student.astype(jnp.float32)
+        teacher = teacher.astype(jnp.float32)
+        student = student / jnp.sqrt(jnp.sum(jnp.square(student), axis=-1, keepdims=True) + 1e-6)
+        teacher = teacher / jnp.sqrt(jnp.sum(jnp.square(teacher), axis=-1, keepdims=True) + 1e-6)
+
+        logits = jnp.einsum("btd,ctd->btc", student, teacher) / jnp.asarray(temperature, dtype=jnp.float32)
+        batch_size = logits.shape[0]
+        labels = jnp.arange(batch_size)
+
+        student_to_teacher = -jax.nn.log_softmax(logits, axis=-1)[labels, :, labels]
+        teacher_to_student = -jax.nn.log_softmax(jnp.swapaxes(logits, 0, 2), axis=-1)[labels, :, labels]
+        losses = 0.5 * (student_to_teacher + teacher_to_student)
+
+        weights = token_mask.astype(losses.dtype)
+        denom = jnp.maximum(jnp.sum(weights, axis=-1), jnp.asarray(1.0, dtype=losses.dtype))
+        return jnp.sum(losses * weights, axis=-1) / denom
+
     def _project_flow_distill(self, hidden, layer_ordinal: int):
         hidden = getattr(self, f"flow_distill_proj_in_{layer_ordinal}")(hidden)
         hidden = nnx.swish(hidden)
@@ -534,31 +556,57 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         depth_mask_tokens = jnp.ones((actions.shape[0], self.depth_token_count), dtype=jnp.bool_)
         flow_losses = []
         depth_losses = []
+        flow_contrast_losses = []
+        depth_contrast_losses = []
         for layer_ordinal, layer in enumerate(layers):
             _, student_hidden, flow_hidden, depth_hidden = layer
+            student_flow_hidden = self._project_flow_distill(student_hidden[:, flow_slice, :], layer_ordinal)
+            teacher_flow_hidden = jax.lax.stop_gradient(flow_hidden[:, teacher_slice(self.flow_token_count), :])
             flow_losses.append(
                 self._cosine_distance_masked(
-                    self._project_flow_distill(student_hidden[:, flow_slice, :], layer_ordinal),
-                    jax.lax.stop_gradient(flow_hidden[:, teacher_slice(self.flow_token_count), :]),
+                    student_flow_hidden,
+                    teacher_flow_hidden,
                     flow_mask_tokens,
                 )
             )
+            flow_contrast_losses.append(
+                self._tokenwise_contrastive_cosine_loss(
+                    student_flow_hidden,
+                    teacher_flow_hidden,
+                    flow_mask_tokens,
+                    self.distill_contrast_temperature,
+                )
+            )
+            student_depth_hidden = self._project_depth_distill(student_hidden[:, depth_slice, :], layer_ordinal)
+            teacher_depth_hidden = jax.lax.stop_gradient(depth_hidden[:, teacher_slice(self.depth_token_count), :])
             depth_losses.append(
                 self._cosine_distance_masked(
-                    self._project_depth_distill(student_hidden[:, depth_slice, :], layer_ordinal),
-                    jax.lax.stop_gradient(depth_hidden[:, teacher_slice(self.depth_token_count), :]),
+                    student_depth_hidden,
+                    teacher_depth_hidden,
                     depth_mask_tokens,
+                )
+            )
+            depth_contrast_losses.append(
+                self._tokenwise_contrastive_cosine_loss(
+                    student_depth_hidden,
+                    teacher_depth_hidden,
+                    depth_mask_tokens,
+                    self.distill_contrast_temperature,
                 )
             )
 
         future_flow_align_loss = jnp.mean(jnp.stack(flow_losses, axis=0), axis=0)
         future_depth_align_loss = jnp.mean(jnp.stack(depth_losses, axis=0), axis=0)
+        future_flow_contrast_loss = jnp.mean(jnp.stack(flow_contrast_losses, axis=0), axis=0)
+        future_depth_contrast_loss = jnp.mean(jnp.stack(depth_contrast_losses, axis=0), axis=0)
         total_loss = (
             self.student_action_loss_weight * student_action_loss
             + self.flow_teacher_action_loss_weight * flow_teacher_action_loss
             + self.depth_teacher_action_loss_weight * depth_teacher_action_loss
             + self.future_flow_align_loss_weight * future_flow_align_loss
             + self.future_depth_align_loss_weight * future_depth_align_loss
+            + self.future_flow_contrast_loss_weight * future_flow_contrast_loss
+            + self.future_depth_contrast_loss_weight * future_depth_contrast_loss
         )
         stats = {
             "loss/student_action": student_action_loss,
@@ -566,6 +614,8 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             "loss/depth_teacher_action": depth_teacher_action_loss,
             "loss/distill_future_flow": future_flow_align_loss,
             "loss/distill_future_depth": future_depth_align_loss,
+            "loss/contrast_future_flow": future_flow_contrast_loss,
+            "loss/contrast_future_depth": future_depth_contrast_loss,
             "noise/student_future_query_token_rate": jnp.mean(noised_rate),
             "noise/student_future_query_scale": self._student_query_noise_scale(train_progress),
             "loss/total": total_loss,

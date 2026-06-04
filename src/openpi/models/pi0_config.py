@@ -274,6 +274,9 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     flow_teacher_action_loss_weight: float = 1.0
     depth_teacher_action_loss_weight: float = 1.0
     future_depth_align_loss_weight: float = 0.1
+    future_flow_contrast_loss_weight: float = 0.0
+    future_depth_contrast_loss_weight: float = 0.0
+    distill_contrast_temperature: float = 0.1
     depth_token_count: int = 16
     depth_distill_projector_hidden_dim: int | None = None
 
@@ -292,6 +295,21 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
             raise ValueError(
                 "future_depth_align_loss_weight must be non-negative, "
                 f"got {self.future_depth_align_loss_weight}."
+            )
+        if self.future_flow_contrast_loss_weight < 0.0:
+            raise ValueError(
+                "future_flow_contrast_loss_weight must be non-negative, "
+                f"got {self.future_flow_contrast_loss_weight}."
+            )
+        if self.future_depth_contrast_loss_weight < 0.0:
+            raise ValueError(
+                "future_depth_contrast_loss_weight must be non-negative, "
+                f"got {self.future_depth_contrast_loss_weight}."
+            )
+        if self.distill_contrast_temperature <= 0.0:
+            raise ValueError(
+                "distill_contrast_temperature must be positive, "
+                f"got {self.distill_contrast_temperature}."
             )
 
     @override
