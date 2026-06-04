@@ -137,12 +137,19 @@ def _load_weights_and_validate(loader, params_shape):
 
 
 def _preload_model_assets(config: _config.TrainConfig) -> None:
-    flow_vae_name = getattr(config.model, "flow_vae_name", None)
-    if flow_vae_name is not None:
-        from openpi.models.pi0_latent_flow import preload_flow_vae
+    # flow_vae_name = getattr(config.model, "flow_vae_name", None)
+    # if flow_vae_name is not None:
+    #     from openpi.models.pi0_latent_flow import preload_flow_vae
 
-        logging.info("Preloading flow VAE '%s' before model initialization.", flow_vae_name)
-        preload_flow_vae(flow_vae_name)
+    #     logging.info("Preloading flow VAE '%s' before model initialization.", flow_vae_name)
+    #     preload_flow_vae(flow_vae_name)
+
+    visual_encoder_name = getattr(config.model, "visual_encoder_name", None)
+    if visual_encoder_name is not None:
+        from openpi.models.pi0_latent_flow_depth_teachers import preload_resnet_encoder
+
+        logging.info("Preloading visual encoder '%s' before model initialization.", visual_encoder_name)
+        preload_resnet_encoder(visual_encoder_name)
 
 
 @at.typecheck
@@ -266,7 +273,7 @@ def train_step(
         nnx.All(
             nnx.Param,
             nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
-            lambda _, x: x.value.ndim > 1,
+            lambda _, x: hasattr(x.value, "ndim") and x.value.ndim > 1,
         ),
     )
     info = {
@@ -340,11 +347,9 @@ def main(config: _config.TrainConfig):
     wandb.log({"camera_views": images_to_log}, step=0)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-    # 打印可训练参数名
     trainable_params = train_state.params.filter(config.trainable_filter)
     flat = traverse_util.flatten_dict(trainable_params.to_pure_dict())
     
-    # ================= 新增开始 =================
     all_params_flat = traverse_util.flatten_dict(train_state.params.to_pure_dict())
     
     total_params_cnt = sum(np.prod(v.shape) for v in all_params_flat.values() if hasattr(v, "shape"))
@@ -352,14 +357,10 @@ def main(config: _config.TrainConfig):
     
     logging.info(f"Total parameters: {total_params_cnt:,}")
     logging.info(f"Trainable parameters: {trainable_params_cnt:,} ({trainable_params_cnt/total_params_cnt*100:.2f}%)")
-    # ================= 新增结束 =================
 
-    logging.info("Trainable parameters:")
-    for k in flat:
-        logging.info(f"  {'/'.join(k)}  shape={flat[k].shape}")
-        
+    # Full fine-tuning has too many trainable leaves to log individually.
     jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    logging.info("Initialized train state.")
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)

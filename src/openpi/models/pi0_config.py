@@ -266,6 +266,9 @@ class Pi0LatentFlowConfig(Pi0Config):
 
 @dataclasses.dataclass(frozen=True)
 class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
+    visual_encoder_name: str = "microsoft/resnet-50"
+    qformer_layer_count: int = 4
+    qformer_mlp_dim: int = 2048
     flow_teacher_expert_variant: _gemma.Variant = "gemma_300m"
     depth_teacher_expert_variant: _gemma.Variant = "gemma_300m"
     flow_teacher_action_loss_weight: float = 1.0
@@ -277,6 +280,10 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     @override
     def __post_init__(self):
         super().__post_init__()
+        if self.qformer_layer_count < 0:
+            raise ValueError(f"qformer_layer_count must be non-negative, got {self.qformer_layer_count}.")
+        if self.qformer_mlp_dim <= 0:
+            raise ValueError(f"qformer_mlp_dim must be positive, got {self.qformer_mlp_dim}.")
         if self.flow_token_count <= 0:
             raise ValueError(f"flow_token_count must be positive, got {self.flow_token_count}.")
         if self.depth_token_count <= 0:

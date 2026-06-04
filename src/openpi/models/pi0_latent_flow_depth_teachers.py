@@ -3,14 +3,34 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+from transformers import FlaxResNetModel
+
 
 from openpi.models import gemma as _gemma
 from openpi.models import model_tavla as _model
 from openpi.models import pi0_config
 from openpi.models import siglip as _siglip
-from openpi.models.pi0_latent_flow import _get_flow_vae
 from openpi.models.pi0_tavla import make_attn_mask, posemb_sincos
 from openpi.shared import array_typing as at
+
+
+_RESNET_ENCODER_REGISTRY = {}
+
+
+def preload_resnet_encoder(model_name: str) -> None:
+    if model_name in _RESNET_ENCODER_REGISTRY:
+        return
+    model = FlaxResNetModel.from_pretrained(model_name, dtype=jnp.float32)
+    _RESNET_ENCODER_REGISTRY[model_name] = (model, model.params)
+
+
+def _get_resnet_encoder(model_name: str):
+    if model_name not in _RESNET_ENCODER_REGISTRY:
+        raise ValueError(
+            f"ResNet encoder '{model_name}' has not been preloaded. "
+            "Call preload_resnet_encoder(...) before initializing training."
+        )
+    return _RESNET_ENCODER_REGISTRY[model_name]
 
 
 class Pi0LatentFlowDepthTeachers(_model.BaseModel):
@@ -29,9 +49,9 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         self.flow_token_count = int(config.flow_token_count)
         self.depth_token_count = int(config.depth_token_count)
         self.future_visual_channels = 3
-        # self.flow_vae_name = getattr(config, "flow_vae_name", "stabilityai/sdxl-vae")
-        # self.flow_vae, flow_vae_params = _get_flow_vae(self.flow_vae_name)
-        # self.flow_vae_params = nnx.Variable(flow_vae_params)
+        self.visual_encoder_name = config.visual_encoder_name
+        self.qformer_layer_count = int(config.qformer_layer_count)
+        self.qformer_mlp_dim = int(config.qformer_mlp_dim)
         self.student_future_query_noise_scale_max = float(config.student_future_query_noise_scale_max)
         self.student_future_query_noise_start_ratio = float(config.student_future_query_noise_start_ratio)
         self.student_future_query_noise_end_ratio = float(config.student_future_query_noise_end_ratio)
@@ -135,15 +155,21 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         config: pi0_config.Pi0LatentFlowDepthTeachersConfig,
         rngs: nnx.Rngs,
     ) -> None:
-        patch = 2
-        latent_channels = int(config.flow_vae_latent_channels)
-        setattr(self, f"{name}_vae_patch_merge_factor", patch)
-        setattr(self, f"{name}_vae_proj_in", nnx.Linear(latent_channels * (patch**2), width, rngs=rngs))
-        setattr(self, f"{name}_vae_proj_out", nnx.Linear(width, width, rngs=rngs))
-        setattr(self, f"{name}_vae_norm", nnx.LayerNorm(num_features=width, rngs=rngs))
-        setattr(self, f"{name}_vae_query_proj", nnx.Linear(width, width, rngs=rngs))
-        setattr(self, f"{name}_vae_key_proj", nnx.Linear(width, width, rngs=rngs))
-        setattr(self, f"{name}_vae_value_proj", nnx.Linear(width, width, rngs=rngs))
+        resnet, resnet_params = _get_resnet_encoder(config.visual_encoder_name)
+        setattr(self, f"{name}_resnet", resnet)
+        setattr(self, f"{name}_resnet_params", nnx.Param(jax.tree.map(lambda x: jnp.asarray(x), resnet_params)))
+        setattr(self, f"{name}_visual_proj", nnx.Linear(2048, width, rngs=rngs))
+        setattr(self, f"{name}_visual_norm", nnx.LayerNorm(num_features=width, rngs=rngs))
+        for layer_idx in range(self.qformer_layer_count):
+            setattr(self, f"{name}_qformer_query_norm_{layer_idx}", nnx.LayerNorm(num_features=width, rngs=rngs))
+            setattr(self, f"{name}_qformer_context_norm_{layer_idx}", nnx.LayerNorm(num_features=width, rngs=rngs))
+            setattr(self, f"{name}_qformer_q_proj_{layer_idx}", nnx.Linear(width, width, rngs=rngs))
+            setattr(self, f"{name}_qformer_k_proj_{layer_idx}", nnx.Linear(width, width, rngs=rngs))
+            setattr(self, f"{name}_qformer_v_proj_{layer_idx}", nnx.Linear(width, width, rngs=rngs))
+            setattr(self, f"{name}_qformer_out_proj_{layer_idx}", nnx.Linear(width, width, rngs=rngs))
+            setattr(self, f"{name}_qformer_mlp_norm_{layer_idx}", nnx.LayerNorm(num_features=width, rngs=rngs))
+            setattr(self, f"{name}_qformer_mlp_in_{layer_idx}", nnx.Linear(width, self.qformer_mlp_dim, rngs=rngs))
+            setattr(self, f"{name}_qformer_mlp_out_{layer_idx}", nnx.Linear(self.qformer_mlp_dim, width, rngs=rngs))
         setattr(
             self,
             f"{name}_teacher_future_query",
@@ -217,34 +243,35 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         if x.shape[-1] != self.future_visual_channels:
             raise ValueError(f"Expected {name} image with {self.future_visual_channels} channels, got {x.shape}.")
         x = jnp.transpose(x, (0, 3, 1, 2))
-        posterior = self.flow_vae.apply(
-            {"params": self.flow_vae_params.value},
+        outputs = getattr(self, f"{name}_resnet")(
             x,
-            deterministic=True,
-            method=self.flow_vae.encode,
-        ).latent_dist
-        x = jax.lax.stop_gradient(posterior.mode() * self.flow_vae.config.scaling_factor)
-        patch = getattr(self, f"{name}_vae_patch_merge_factor")
-        if x.shape[1] % patch != 0 or x.shape[2] % patch != 0:
-            raise ValueError(f"{name} latent spatial size must be divisible by {patch}, got shape={x.shape}.")
-        x = einops.rearrange(x, "b (h ph) (w pw) c -> b h w (ph pw c)", ph=patch, pw=patch)
-        latent = einops.rearrange(x, "b h w c -> b (h w) c")
-        latent = getattr(self, f"{name}_vae_proj_in")(latent)
-        latent = nnx.swish(latent)
-        latent = getattr(self, f"{name}_vae_proj_out")(latent)
-        return getattr(self, f"{name}_vae_norm")(latent)
+            params=getattr(self, f"{name}_resnet_params").value,
+            train=False,
+        )
+        latent = einops.rearrange(outputs.last_hidden_state, "b c h w -> b (h w) c")
+        latent = getattr(self, f"{name}_visual_proj")(latent)
+        return getattr(self, f"{name}_visual_norm")(latent)
 
     def _compress_visuals(self, obs: _model.Observation, name: str):
         latent = jnp.concatenate([self._encode_visual(image, name) for image in self._visual_images(obs, name)], axis=1)
         query = jnp.asarray(getattr(self, f"{name}_teacher_future_query").value, dtype=latent.dtype)
         query = query + jnp.asarray(getattr(self, f"{name}_token_embedding").value, dtype=latent.dtype)
         query = jnp.broadcast_to(query[None], (latent.shape[0], *query.shape))
-        query = getattr(self, f"{name}_vae_query_proj")(query)
-        keys = getattr(self, f"{name}_vae_key_proj")(latent)
-        values = getattr(self, f"{name}_vae_value_proj")(latent)
-        logits = jnp.einsum("bqd,bkd->bqk", query, keys) / jnp.sqrt(jnp.asarray(query.shape[-1], dtype=latent.dtype))
-        attn = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(values.dtype)
-        return jnp.einsum("bqk,bkd->bqd", attn, values)
+        for layer_idx in range(self.qformer_layer_count):
+            q = getattr(self, f"{name}_qformer_query_norm_{layer_idx}")(query)
+            context = getattr(self, f"{name}_qformer_context_norm_{layer_idx}")(latent)
+            q = getattr(self, f"{name}_qformer_q_proj_{layer_idx}")(q)
+            keys = getattr(self, f"{name}_qformer_k_proj_{layer_idx}")(context)
+            values = getattr(self, f"{name}_qformer_v_proj_{layer_idx}")(context)
+            logits = jnp.einsum("bqd,bkd->bqk", q, keys) / jnp.sqrt(jnp.asarray(q.shape[-1], dtype=latent.dtype))
+            attn = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(values.dtype)
+            attended = jnp.einsum("bqk,bkd->bqd", attn, values)
+            query = query + getattr(self, f"{name}_qformer_out_proj_{layer_idx}")(attended)
+            mlp = getattr(self, f"{name}_qformer_mlp_norm_{layer_idx}")(query)
+            mlp = getattr(self, f"{name}_qformer_mlp_in_{layer_idx}")(mlp)
+            mlp = nnx.swish(mlp)
+            query = query + getattr(self, f"{name}_qformer_mlp_out_{layer_idx}")(mlp)
+        return query
 
     def embed_prefix(self, obs: _model.Observation):
         tokens = []
