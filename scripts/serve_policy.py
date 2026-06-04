@@ -116,7 +116,16 @@ def main(args: Args) -> None:
     )
     server.serve_forever()
 
+def debug():
+    import debugpy
+    debugpy.listen(("0.0.0.0", 5678))
+    print("✅ Waiting for debugger to attach on port 5678...")
+    debugpy.wait_for_client()
+    print("Start to debugging")
+    
+    
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, force=True)
+    # debug()
     main(tyro.cli(Args))

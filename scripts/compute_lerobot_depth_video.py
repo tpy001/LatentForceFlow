@@ -246,8 +246,8 @@ class DepthAnythingPredictor:
         processor_cls, model_cls = require_transformers()
 
         self.device = device or ("cuda" if torch_module.cuda.is_available() else "cpu")
-        if dtype == "auto":
-            self.dtype = torch_module.float16 if self.device.startswith("cuda") else torch_module.float32
+        if dtype == "default":
+            self.dtype = None
         elif dtype == "float16":
             self.dtype = torch_module.float16
         elif dtype == "bfloat16":
@@ -258,7 +258,10 @@ class DepthAnythingPredictor:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
         self.processor = processor_cls.from_pretrained(model_id, use_fast=True)
-        self.model = model_cls.from_pretrained(model_id, torch_dtype=self.dtype).to(self.device).eval()
+        if self.dtype is None:
+            self.model = model_cls.from_pretrained(model_id).to(self.device).eval()
+        else:
+            self.model = model_cls.from_pretrained(model_id, torch_dtype=self.dtype).to(self.device).eval()
 
     def predict(self, image: np.ndarray) -> np.ndarray:
         pil_image_cls = require_pil_image()
@@ -267,7 +270,13 @@ class DepthAnythingPredictor:
         pil_image = pil_image_cls.fromarray(rgb)
 
         inputs = self.processor(images=pil_image, return_tensors="pt")
-        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        if self.dtype is None:
+            inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        else:
+            inputs = {
+                key: value.to(self.device, dtype=self.dtype) if torch_module.is_floating_point(value) else value.to(self.device)
+                for key, value in inputs.items()
+            }
         with torch_module.inference_mode():
             prediction = self.model(**inputs).predicted_depth
             prediction = F.interpolate(
@@ -409,21 +418,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None, help="Torch device for Depth Anything. Defaults to cuda if available.")
     parser.add_argument(
         "--dtype",
-        choices=("auto", "float16", "bfloat16", "float32"),
-        default="auto",
-        help="Model dtype. auto uses float16 on CUDA and float32 otherwise.",
+        choices=("default", "float16", "bfloat16", "float32"),
+        default="default",
+        help="Model dtype. default uses the precision chosen by the model/framework.",
     )
     parser.add_argument("--fps", type=float, default=None, help="Output video FPS. Defaults to dataset metadata fps.")
     parser.add_argument(
         "--colormap",
         choices=("turbo", "magma", "inferno", "viridis", "jet"),
-        default="turbo",
+        default="inferno",
         help="OpenCV color map used to render depth videos.",
     )
     parser.add_argument("--invert", action="store_true", help="Invert rendered colors.")
     parser.add_argument("--save-npy", action="store_true", help="Also save raw H x W relative depth maps under OUTPUT_DIR/depths.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing depth files and videos.")
     parser.add_argument("--video-backend", default="torchcodec", help="LeRobot video backend.")
+    parser.add_argument("--torch-threads", type=int, default=None, help="Limit PyTorch CPU worker threads.")
+    parser.add_argument("--torch-interop-threads", type=int, default=None, help="Limit PyTorch inter-op CPU threads.")
+    parser.add_argument("--opencv-threads", type=int, default=None, help="Limit OpenCV CPU worker threads.")
     return parser.parse_args()
 
 
@@ -431,6 +443,21 @@ def main() -> None:
     args = parse_args()
     if args.fps is not None and args.fps <= 0:
         raise ValueError(f"Expected --fps > 0, got {args.fps}.")
+    if args.torch_threads is not None:
+        if args.torch_threads <= 0:
+            raise ValueError(f"Expected --torch-threads > 0, got {args.torch_threads}.")
+        if torch is not None:
+            torch.set_num_threads(args.torch_threads)
+    if args.torch_interop_threads is not None:
+        if args.torch_interop_threads <= 0:
+            raise ValueError(f"Expected --torch-interop-threads > 0, got {args.torch_interop_threads}.")
+        if torch is not None:
+            torch.set_num_interop_threads(args.torch_interop_threads)
+    if args.opencv_threads is not None:
+        if args.opencv_threads <= 0:
+            raise ValueError(f"Expected --opencv-threads > 0, got {args.opencv_threads}.")
+        if cv2 is not None:
+            cv2.setNumThreads(args.opencv_threads)
 
     lr_dataset = require_lerobot_dataset()
     metadata = lr_dataset.LeRobotDatasetMetadata(args.repo_id)
@@ -493,7 +520,7 @@ def main() -> None:
         "fps": fps,
         "model": args.model,
         "device": predictor.device,
-        "dtype": str(predictor.dtype),
+        "dtype": "default" if predictor.dtype is None else str(predictor.dtype),
         "colormap": args.colormap,
         "invert": args.invert,
         "save_npy": args.save_npy,

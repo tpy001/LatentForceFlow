@@ -364,6 +364,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-npy", action="store_true", help="Also save raw H x W x 2 flow arrays under OUTPUT_DIR/flows.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing flow files and videos.")
     parser.add_argument("--video-backend", default="torchcodec", help="LeRobot video backend.")
+    parser.add_argument("--torch-threads", type=int, default=None, help="Limit PyTorch CPU worker threads.")
+    parser.add_argument("--torch-interop-threads", type=int, default=None, help="Limit PyTorch inter-op CPU threads.")
+    parser.add_argument("--opencv-threads", type=int, default=None, help="Limit OpenCV CPU worker threads.")
     return parser.parse_args()
 
 
@@ -375,6 +378,21 @@ def main() -> None:
         raise ValueError(f"Expected --sigma > 0, got {args.sigma}.")
     if args.fps is not None and args.fps <= 0:
         raise ValueError(f"Expected --fps > 0, got {args.fps}.")
+    if args.torch_threads is not None:
+        if args.torch_threads <= 0:
+            raise ValueError(f"Expected --torch-threads > 0, got {args.torch_threads}.")
+        if torch is not None:
+            torch.set_num_threads(args.torch_threads)
+    if args.torch_interop_threads is not None:
+        if args.torch_interop_threads <= 0:
+            raise ValueError(f"Expected --torch-interop-threads > 0, got {args.torch_interop_threads}.")
+        if torch is not None:
+            torch.set_num_interop_threads(args.torch_interop_threads)
+    if args.opencv_threads is not None:
+        if args.opencv_threads <= 0:
+            raise ValueError(f"Expected --opencv-threads > 0, got {args.opencv_threads}.")
+        if cv2 is not None:
+            cv2.setNumThreads(args.opencv_threads)
 
     lr_dataset = require_lerobot_dataset()
     openpi_transforms = require_transforms()
