@@ -194,7 +194,7 @@ def _augment_with_mor_action_expert_weights(loaded_params: at.Params, params: at
 
 
 def _augment_with_flow_depth_teacher_action_weights(loaded_params: at.Params, params: at.Params) -> at.Params:
-    """Copies reusable pi0/pi0_latent_flow action-path weights into flow/depth teacher slots."""
+    """Copies reusable pi0/pi0_latent_flow action-path weights into visual teacher slots."""
     flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
     flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
     augmented = dict(flat_loaded)
@@ -203,18 +203,23 @@ def _augment_with_flow_depth_teacher_action_weights(loaded_params: at.Params, pa
         "state_proj_student": ("state_proj_student", "state_proj"),
         "state_proj_flow_teacher": ("state_proj_teacher", "state_proj"),
         "state_proj_depth_teacher": ("state_proj_teacher", "state_proj"),
+        "state_proj_image_teacher": ("state_proj_teacher", "state_proj"),
         "action_in_proj_student": ("action_in_proj_student", "action_in_proj"),
         "action_in_proj_flow_teacher": ("action_in_proj_teacher", "action_in_proj"),
         "action_in_proj_depth_teacher": ("action_in_proj_teacher", "action_in_proj"),
+        "action_in_proj_image_teacher": ("action_in_proj_teacher", "action_in_proj"),
         "action_out_proj_student": ("action_out_proj_student", "action_out_proj"),
         "action_out_proj_flow_teacher": ("action_out_proj_teacher", "action_out_proj"),
         "action_out_proj_depth_teacher": ("action_out_proj_teacher", "action_out_proj"),
+        "action_out_proj_image_teacher": ("action_out_proj_teacher", "action_out_proj"),
         "student_time_mlp_in": ("student_time_mlp_in", "action_time_mlp_in", "time_mlp_in"),
         "student_time_mlp_out": ("student_time_mlp_out", "action_time_mlp_out", "time_mlp_out"),
         "flow_teacher_time_mlp_in": ("teacher_time_mlp_in", "action_time_mlp_in", "time_mlp_in"),
         "flow_teacher_time_mlp_out": ("teacher_time_mlp_out", "action_time_mlp_out", "time_mlp_out"),
         "depth_teacher_time_mlp_in": ("teacher_time_mlp_in", "action_time_mlp_in", "time_mlp_in"),
         "depth_teacher_time_mlp_out": ("teacher_time_mlp_out", "action_time_mlp_out", "time_mlp_out"),
+        "image_teacher_time_mlp_in": ("teacher_time_mlp_in", "action_time_mlp_in", "time_mlp_in"),
+        "image_teacher_time_mlp_out": ("teacher_time_mlp_out", "action_time_mlp_out", "time_mlp_out"),
     }
 
     copied = 0
@@ -240,6 +245,6 @@ def _augment_with_flow_depth_teacher_action_weights(loaded_params: at.Params, pa
                 break
 
     if copied > 0:
-        logger.info("Mapped %d reusable action-path tensors into flow/depth teacher model.", copied)
+        logger.info("Mapped %d reusable action-path tensors into visual teacher model.", copied)
 
     return flax.traverse_util.unflatten_dict(augmented, sep="/")

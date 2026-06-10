@@ -26,6 +26,13 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
+def _split_current_future_image(image):
+    image = np.asarray(image)
+    if image.ndim >= 4 and image.shape[0] >= 2:
+        return image[0], image[1]
+    return image, None
+
+
 @dataclasses.dataclass(frozen=True)
 class LiberoInputs(transforms.DataTransformFn):
     """
@@ -49,8 +56,10 @@ class LiberoInputs(transforms.DataTransformFn):
         # and two wrist views (left and right). If your dataset does not have a particular type
         # of image, e.g. wrist images, you can comment it out here and replace it with zeros like we do for the
         # right wrist image below.
-        base_image = _parse_image(data["observation/image"])
-        wrist_image = _parse_image(data["observation/wrist_image"])
+        base_image_raw, future_base_image = _split_current_future_image(data["observation/image"])
+        wrist_image_raw, future_wrist_image = _split_current_future_image(data["observation/wrist_image"])
+        base_image = _parse_image(base_image_raw)
+        wrist_image = _parse_image(wrist_image_raw)
 
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
@@ -71,6 +80,15 @@ class LiberoInputs(transforms.DataTransformFn):
 
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.
+        if future_base_image is not None:
+            inputs["future_rgb_img"] = _parse_image(future_base_image)
+        if future_wrist_image is not None:
+            inputs["future_wrist_rgb_img"] = _parse_image(future_wrist_image)
+        if "observation/future_image" in data:
+            inputs["future_rgb_img"] = _parse_image(data["observation/future_image"])
+        if "observation/future_wrist_image" in data:
+            inputs["future_wrist_rgb_img"] = _parse_image(data["observation/future_wrist_image"])
+
         if "actions" in data:
             inputs["actions"] = data["actions"]
 
@@ -95,6 +113,10 @@ class LiberoFlowDepthInputs(LiberoInputs):
             inputs["depth_img"] = _parse_image(data["observation/depth_image"])
         if "observation/depth_wrist_image" in data.keys():
             inputs["wrist_depth_img"] = _parse_image(data["observation/depth_wrist_image"])
+        if "observation/future_image" in data.keys():
+            inputs["future_rgb_img"] = _parse_image(data["observation/future_image"])
+        if "observation/future_wrist_image" in data.keys():
+            inputs["future_wrist_rgb_img"] = _parse_image(data["observation/future_wrist_image"])
         return inputs
 
 

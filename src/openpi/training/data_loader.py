@@ -226,6 +226,8 @@ def create_torch_dataset(
     if isinstance(model_config, pi0_config.Pi0LatentFlowDepthTeachersConfig):
         delta_timestamps["depth_image"] = [model_config.action_horizon / dataset_meta.fps]
         delta_timestamps["depth_wrist_image"] = [model_config.action_horizon / dataset_meta.fps]
+        delta_timestamps["image"] = [0.0, model_config.action_horizon / dataset_meta.fps]
+        delta_timestamps["wrist_image"] = [0.0, model_config.action_horizon / dataset_meta.fps]
 
     if (
         isinstance(model_config, (pi0_config.Pi0LatentFlowConfig, pi0_config.Pi0SeerConfig))

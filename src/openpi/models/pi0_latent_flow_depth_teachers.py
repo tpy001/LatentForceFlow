@@ -44,13 +44,16 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         self.student_action_loss_weight = float(config.student_action_loss_weight)
         self.flow_teacher_action_loss_weight = float(config.flow_teacher_action_loss_weight)
         self.depth_teacher_action_loss_weight = float(config.depth_teacher_action_loss_weight)
+        self.image_teacher_action_loss_weight = float(config.image_teacher_action_loss_weight)
         self.future_flow_align_loss_weight = float(config.future_flow_align_loss_weight)
         self.future_depth_align_loss_weight = float(config.future_depth_align_loss_weight)
+        self.future_image_align_loss_weight = float(config.future_image_align_loss_weight)
         self.future_flow_contrast_loss_weight = float(config.future_flow_contrast_loss_weight)
         self.future_depth_contrast_loss_weight = float(config.future_depth_contrast_loss_weight)
         self.distill_contrast_temperature = float(config.distill_contrast_temperature)
         self.flow_token_count = int(config.flow_token_count)
         self.depth_token_count = int(config.depth_token_count)
+        self.image_token_count = int(config.image_token_count)
         self.future_visual_channels = 3
         self.visual_encoder_name = config.visual_encoder_name
         self.qformer_layer_count = int(config.qformer_layer_count)
@@ -64,9 +67,11 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         student_config = _gemma.get_config(config.action_expert_variant)
         flow_teacher_config = _gemma.get_config(config.flow_teacher_expert_variant)
         depth_teacher_config = _gemma.get_config(config.depth_teacher_expert_variant)
+        image_teacher_config = _gemma.get_config(config.image_teacher_expert_variant)
         self.student_width = int(student_config.width)
         self.flow_teacher_width = int(flow_teacher_config.width)
         self.depth_teacher_width = int(depth_teacher_config.width)
+        self.image_teacher_width = int(image_teacher_config.width)
         self.flow_projector_hidden_dim = int(
             config.distill_projector_hidden_dim
             if config.distill_projector_hidden_dim is not None
@@ -77,10 +82,15 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             if config.depth_distill_projector_hidden_dim is not None
             else depth_teacher_config.width
         )
+        self.image_projector_hidden_dim = int(
+            config.image_distill_projector_hidden_dim
+            if config.image_distill_projector_hidden_dim is not None
+            else image_teacher_config.width
+        )
 
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
-                configs=[paligemma_config, student_config, flow_teacher_config, depth_teacher_config],
+                configs=[paligemma_config, student_config, flow_teacher_config, depth_teacher_config, image_teacher_config],
                 embed_dtype=config.dtype,
                 adarms=config.pi05,
             )
@@ -88,7 +98,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         llm.lazy_init(
             rngs=rngs,
             method="init",
-            use_adarms=[False, True, True, True] if config.pi05 else [False, False, False, False],
+            use_adarms=[False, True, True, True, True] if config.pi05 else [False, False, False, False, False],
         )
 
         img = nnx_bridge.ToNNX(
@@ -106,6 +116,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         self._init_action_path("student", student_config.width, rngs)
         self._init_action_path("flow_teacher", flow_teacher_config.width, rngs)
         self._init_action_path("depth_teacher", depth_teacher_config.width, rngs)
+        self._init_action_path("image_teacher", image_teacher_config.width, rngs)
 
         self.student_future_flow_query = nnx.Param(
             0.02 * jax.random.normal(rngs.params(), (self.flow_token_count, self.student_width), dtype=jnp.float32)
@@ -113,9 +124,13 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         self.student_future_depth_query = nnx.Param(
             0.02 * jax.random.normal(rngs.params(), (self.depth_token_count, self.student_width), dtype=jnp.float32)
         )
+        self.student_future_image_query = nnx.Param(
+            0.02 * jax.random.normal(rngs.params(), (self.image_token_count, self.student_width), dtype=jnp.float32)
+        )
 
-        self._init_visual_teacher("flow", self.flow_token_count, self.flow_teacher_width, config, rngs)
-        self._init_visual_teacher("depth", self.depth_token_count, self.depth_teacher_width, config, rngs)
+        # self._init_visual_teacher("flow", self.flow_token_count, self.flow_teacher_width, config, rngs)
+        # self._init_visual_teacher("depth", self.depth_token_count, self.depth_teacher_width, config, rngs)
+        # self._init_visual_teacher("image", self.image_token_count, self.image_teacher_width, config, rngs)
 
         for layer_ordinal, _ in enumerate(self.distill_layer_indices):
             setattr(
@@ -137,6 +152,16 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                 self,
                 f"depth_distill_proj_out_{layer_ordinal}",
                 nnx.Linear(self.depth_projector_hidden_dim, self.depth_teacher_width, rngs=rngs),
+            )
+            setattr(
+                self,
+                f"image_distill_proj_in_{layer_ordinal}",
+                nnx.Linear(self.student_width, self.image_projector_hidden_dim, rngs=rngs),
+            )
+            setattr(
+                self,
+                f"image_distill_proj_out_{layer_ordinal}",
+                nnx.Linear(self.image_projector_hidden_dim, self.image_teacher_width, rngs=rngs),
             )
 
     def _init_action_path(self, name: str, width: int, rngs: nnx.Rngs) -> None:
@@ -197,8 +222,10 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
     def _student_query_tokens(self, batch_size, dtype, *, train, noise_rng, train_progress, query_noise_scale=None):
         flow = jnp.asarray(self.student_future_flow_query.value, dtype=dtype)
         depth = jnp.asarray(self.student_future_depth_query.value, dtype=dtype)
+        image = jnp.asarray(self.student_future_image_query.value, dtype=dtype)
         flow = jnp.broadcast_to(flow[None], (batch_size, *flow.shape))
         depth = jnp.broadcast_to(depth[None], (batch_size, *depth.shape))
+        image = jnp.broadcast_to(image[None], (batch_size, *image.shape))
         noise_scale_f32 = (
             self._student_query_noise_scale(train_progress)
             if query_noise_scale is None
@@ -208,17 +235,19 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         if (not train and query_noise_scale is None) or (
             query_noise_scale is None and float(self.student_future_query_noise_scale_max) <= 0.0
         ):
-            return flow, depth, jnp.zeros((batch_size,), dtype=jnp.float32)
+            return flow, depth, image, jnp.zeros((batch_size,), dtype=jnp.float32)
         if noise_rng is None:
             raise ValueError("noise_rng is required when student future query noise is enabled.")
-        flow_rng, depth_rng = jax.random.split(noise_rng)
+        flow_rng, depth_rng, image_rng = jax.random.split(noise_rng, 3)
         noise_scale = noise_scale_f32.astype(dtype)
         flow_rms = jnp.sqrt(jnp.mean(jnp.square(flow.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-6)
         depth_rms = jnp.sqrt(jnp.mean(jnp.square(depth.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-6)
+        image_rms = jnp.sqrt(jnp.mean(jnp.square(image.astype(jnp.float32)), axis=-1, keepdims=True) + 1e-6)
         flow = flow + noise_scale * flow_rms.astype(dtype) * jax.random.normal(flow_rng, flow.shape, dtype=dtype)
         depth = depth + noise_scale * depth_rms.astype(dtype) * jax.random.normal(depth_rng, depth.shape, dtype=dtype)
+        image = image + noise_scale * image_rms.astype(dtype) * jax.random.normal(image_rng, image.shape, dtype=dtype)
         rate = jnp.ones((batch_size,), dtype=jnp.float32) * jnp.where(noise_scale_f32 > 0.0, 1.0, 0.0)
-        return flow, depth, rate
+        return flow, depth, image, rate
 
     @staticmethod
     def _require_image(image, field_name: str):
@@ -236,6 +265,11 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             return (
                 self._require_image(obs.depth_img, "observation.depth_img"),
                 self._require_image(obs.wrist_depth_img, "observation.wrist_depth_img"),
+            )
+        if name == "image":
+            return (
+                self._require_image(obs.future_rgb_img, "observation.future_rgb_img"),
+                self._require_image(obs.future_wrist_rgb_img, "observation.future_wrist_rgb_img"),
             )
         raise ValueError(f"Unknown visual teacher: {name}")
 
@@ -312,7 +346,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         return action_time_tokens, None
 
     def embed_student_suffix(self, obs, noisy_actions, timestep, *, train, noise_rng, train_progress, query_noise_scale=None):
-        flow_query, depth_query, noised_rate = self._student_query_tokens(
+        flow_query, depth_query, image_query, noised_rate = self._student_query_tokens(
             obs.state.shape[0],
             obs.state.dtype,
             train=train,
@@ -322,11 +356,15 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         )
         state = self.state_proj_student(obs.state)[:, None, :]
         actions, adarms = self._embed_action_tokens(noisy_actions, timestep, "student")
-        tokens = jnp.concatenate([state, flow_query, depth_query, actions], axis=1)
+        tokens = jnp.concatenate([state, flow_query, depth_query, image_query, actions], axis=1)
         ar_mask = jnp.array(
             [False]
-            + ([False] * self.flow_token_count)
-            + ([False] * self.depth_token_count)
+            + [True]
+            + ([False] * (self.flow_token_count - 1))
+            + [True]
+            + ([False] * (self.depth_token_count - 1))
+            + [True]
+            + ([False] * (self.image_token_count - 1))
             + [True]
             + ([False] * (actions.shape[1] - 1))
         )
@@ -334,7 +372,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
 
     def embed_teacher_suffix(self, obs, noisy_actions, timestep, name: str):
         teacher = f"{name}_teacher"
-        token_count = self.flow_token_count if name == "flow" else self.depth_token_count
+        token_count = {"flow": self.flow_token_count, "depth": self.depth_token_count, "image": self.image_token_count}[name]
         state = getattr(self, f"state_proj_{teacher}")(obs.state)[:, None, :]
         visual = self._compress_visuals(obs, name)
         actions, adarms = self._embed_action_tokens(noisy_actions, timestep, teacher)
@@ -359,17 +397,23 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         depth_mask,
         depth_ar_mask,
         depth_adarms,
+        image_tokens,
+        image_mask,
+        image_ar_mask,
+        image_adarms,
     ):
         bsz = prefix_mask.shape[0]
         p_len = prefix_mask.shape[1]
         student_len = student_mask.shape[1]
         flow_len = flow_mask.shape[1]
         depth_len = depth_mask.shape[1]
+        image_len = image_mask.shape[1]
 
         prefix_attn = make_attn_mask(prefix_mask, prefix_ar_mask)
         student_attn = make_attn_mask(student_mask, student_ar_mask)
         flow_attn = make_attn_mask(flow_mask, flow_ar_mask)
         depth_attn = make_attn_mask(depth_mask, depth_ar_mask)
+        image_attn = make_attn_mask(image_mask, image_ar_mask)
 
         def suffix_to_prefix(suffix_mask, allow_prefix):
             attn = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_mask.shape[1])
@@ -382,6 +426,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                 [True]
                 + ([True] * self.flow_token_count)
                 + ([True] * self.depth_token_count)
+                + ([True] * self.image_token_count)
                 + ([True] * self.action_horizon)
             ),
         )
@@ -393,6 +438,10 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             depth_mask,
             jnp.array([True] + ([True] * self.depth_token_count) + ([True] * self.action_horizon)),
         )
+        image_prefix = suffix_to_prefix(
+            image_mask,
+            jnp.array([True] + ([True] * self.image_token_count) + ([True] * self.action_horizon)),
+        )
 
         prefix_row = jnp.concatenate(
             [
@@ -400,6 +449,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                 jnp.zeros((bsz, p_len, student_len), dtype=jnp.bool_),
                 jnp.zeros((bsz, p_len, flow_len), dtype=jnp.bool_),
                 jnp.zeros((bsz, p_len, depth_len), dtype=jnp.bool_),
+                jnp.zeros((bsz, p_len, image_len), dtype=jnp.bool_),
             ],
             axis=-1,
         )
@@ -409,6 +459,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                 student_attn,
                 jnp.zeros((bsz, student_len, flow_len), dtype=jnp.bool_),
                 jnp.zeros((bsz, student_len, depth_len), dtype=jnp.bool_),
+                jnp.zeros((bsz, student_len, image_len), dtype=jnp.bool_),
             ],
             axis=-1,
         )
@@ -418,6 +469,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                 jnp.zeros((bsz, flow_len, student_len), dtype=jnp.bool_),
                 flow_attn,
                 jnp.zeros((bsz, flow_len, depth_len), dtype=jnp.bool_),
+                jnp.zeros((bsz, flow_len, image_len), dtype=jnp.bool_),
             ],
             axis=-1,
         )
@@ -427,22 +479,36 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                 jnp.zeros((bsz, depth_len, student_len), dtype=jnp.bool_),
                 jnp.zeros((bsz, depth_len, flow_len), dtype=jnp.bool_),
                 depth_attn,
+                jnp.zeros((bsz, depth_len, image_len), dtype=jnp.bool_),
             ],
             axis=-1,
         )
-        full_attn = jnp.concatenate([prefix_row, student_row, flow_row, depth_row], axis=1)
+        image_row = jnp.concatenate(
+            [
+                image_prefix,
+                jnp.zeros((bsz, image_len, student_len), dtype=jnp.bool_),
+                jnp.zeros((bsz, image_len, flow_len), dtype=jnp.bool_),
+                jnp.zeros((bsz, image_len, depth_len), dtype=jnp.bool_),
+                image_attn,
+            ],
+            axis=-1,
+        )
+        full_attn = jnp.concatenate([prefix_row, student_row, flow_row, depth_row, image_row], axis=1)
 
         prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
         prefix_len = jnp.sum(prefix_mask, axis=-1)[:, None]
         student_positions = prefix_len + jnp.cumsum(student_mask, axis=-1) - 1
         flow_positions = prefix_len + jnp.cumsum(flow_mask, axis=-1) - 1
         depth_positions = prefix_len + jnp.cumsum(depth_mask, axis=-1) - 1
-        positions = jnp.concatenate([prefix_positions, student_positions, flow_positions, depth_positions], axis=1)
+        image_positions = prefix_len + jnp.cumsum(image_mask, axis=-1) - 1
+        positions = jnp.concatenate(
+            [prefix_positions, student_positions, flow_positions, depth_positions, image_positions], axis=1
+        )
         (outputs, layers), _ = self.PaliGemma.llm(
-            [prefix_tokens, student_tokens, flow_tokens, depth_tokens],
+            [prefix_tokens, student_tokens, flow_tokens, depth_tokens, image_tokens],
             mask=full_attn,
             positions=positions,
-            adarms_cond=[None, student_adarms, flow_adarms, depth_adarms],
+            adarms_cond=[None, student_adarms, flow_adarms, depth_adarms, image_adarms],
             return_layer_indices=self.distill_layer_indices,
         )
         return outputs, layers
@@ -458,24 +524,6 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         denom = jnp.maximum(jnp.sum(weights, axis=-1), jnp.asarray(1.0, dtype=losses.dtype))
         return jnp.sum(losses * weights, axis=-1) / denom
 
-    @staticmethod
-    def _tokenwise_contrastive_cosine_loss(student, teacher, token_mask, temperature: float):
-        student = student.astype(jnp.float32)
-        teacher = teacher.astype(jnp.float32)
-        student = student / jnp.sqrt(jnp.sum(jnp.square(student), axis=-1, keepdims=True) + 1e-6)
-        teacher = teacher / jnp.sqrt(jnp.sum(jnp.square(teacher), axis=-1, keepdims=True) + 1e-6)
-
-        logits = jnp.einsum("btd,ctd->btc", student, teacher) / jnp.asarray(temperature, dtype=jnp.float32)
-        batch_size = logits.shape[0]
-        labels = jnp.arange(batch_size)
-
-        student_to_teacher = -jax.nn.log_softmax(logits, axis=-1)[labels, :, labels]
-        teacher_to_student = -jax.nn.log_softmax(jnp.swapaxes(logits, 0, 2), axis=-1)[labels, :, labels]
-        losses = 0.5 * (student_to_teacher + teacher_to_student)
-
-        weights = token_mask.astype(losses.dtype)
-        denom = jnp.maximum(jnp.sum(weights, axis=-1), jnp.asarray(1.0, dtype=losses.dtype))
-        return jnp.sum(losses * weights, axis=-1) / denom
 
     def _project_flow_distill(self, hidden, layer_ordinal: int):
         hidden = getattr(self, f"flow_distill_proj_in_{layer_ordinal}")(hidden)
@@ -487,10 +535,15 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         hidden = nnx.swish(hidden)
         return getattr(self, f"depth_distill_proj_out_{layer_ordinal}")(hidden)
 
+    def _project_image_distill(self, hidden, layer_ordinal: int):
+        hidden = getattr(self, f"image_distill_proj_in_{layer_ordinal}")(hidden)
+        hidden = nnx.swish(hidden)
+        return getattr(self, f"image_distill_proj_out_{layer_ordinal}")(hidden)
+
     @staticmethod
     def _restore_aux_images(processed, original):
         updates = {}
-        for key in ("flow_img", "wrist_flow_img", "depth_img", "wrist_depth_img"):
+        for key in ("flow_img", "wrist_flow_img", "depth_img", "wrist_depth_img", "future_rgb_img", "future_wrist_rgb_img"):
             value = getattr(original, key)
             if value is not None:
                 updates[key] = value
@@ -522,6 +575,9 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         depth_tokens, depth_mask, depth_ar_mask, depth_adarms = self.embed_teacher_suffix(
             observation, x_t_action, time, "depth"
         )
+        image_tokens, image_mask, image_ar_mask, image_adarms = self.embed_teacher_suffix(
+            observation, x_t_action, time, "image"
+        )
 
         outputs, layers = self._forward_all_streams(
             prefix_tokens,
@@ -539,27 +595,36 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             depth_mask,
             depth_ar_mask,
             depth_adarms,
+            image_tokens,
+            image_mask,
+            image_ar_mask,
+            image_adarms,
         )
-        _, student_out, flow_out, depth_out = outputs
+        _, student_out, flow_out, depth_out, image_out = outputs
 
         student_v = self.action_out_proj_student(student_out[:, -self.action_horizon :])
         flow_v = self.action_out_proj_flow_teacher(flow_out[:, -self.action_horizon :])
         depth_v = self.action_out_proj_depth_teacher(depth_out[:, -self.action_horizon :])
+        image_v = self.action_out_proj_image_teacher(image_out[:, -self.action_horizon :])
         student_action_loss = jnp.mean(jnp.square(student_v - u_t_action), axis=(-2, -1))
         flow_teacher_action_loss = jnp.mean(jnp.square(flow_v - u_t_action), axis=(-2, -1))
         depth_teacher_action_loss = jnp.mean(jnp.square(depth_v - u_t_action), axis=(-2, -1))
+        image_teacher_action_loss = jnp.mean(jnp.square(image_v - u_t_action), axis=(-2, -1))
 
         flow_slice = slice(1, 1 + self.flow_token_count)
         depth_slice = slice(1 + self.flow_token_count, 1 + self.flow_token_count + self.depth_token_count)
+        image_slice = slice(1 + self.flow_token_count + self.depth_token_count, 1 + self.flow_token_count + self.depth_token_count + self.image_token_count)
         teacher_slice = lambda count: slice(1, 1 + count)
         flow_mask_tokens = jnp.ones((actions.shape[0], self.flow_token_count), dtype=jnp.bool_)
         depth_mask_tokens = jnp.ones((actions.shape[0], self.depth_token_count), dtype=jnp.bool_)
+        image_mask_tokens = jnp.ones((actions.shape[0], self.image_token_count), dtype=jnp.bool_)
         flow_losses = []
         depth_losses = []
+        image_losses = []
         flow_contrast_losses = []
         depth_contrast_losses = []
         for layer_ordinal, layer in enumerate(layers):
-            _, student_hidden, flow_hidden, depth_hidden = layer
+            _, student_hidden, flow_hidden, depth_hidden, image_hidden = layer
             student_flow_hidden = self._project_flow_distill(student_hidden[:, flow_slice, :], layer_ordinal)
             teacher_flow_hidden = jax.lax.stop_gradient(flow_hidden[:, teacher_slice(self.flow_token_count), :])
             flow_losses.append(
@@ -567,14 +632,6 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                     student_flow_hidden,
                     teacher_flow_hidden,
                     flow_mask_tokens,
-                )
-            )
-            flow_contrast_losses.append(
-                self._tokenwise_contrastive_cosine_loss(
-                    student_flow_hidden,
-                    teacher_flow_hidden,
-                    flow_mask_tokens,
-                    self.distill_contrast_temperature,
                 )
             )
             student_depth_hidden = self._project_depth_distill(student_hidden[:, depth_slice, :], layer_ordinal)
@@ -586,36 +643,36 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                     depth_mask_tokens,
                 )
             )
-            depth_contrast_losses.append(
-                self._tokenwise_contrastive_cosine_loss(
-                    student_depth_hidden,
-                    teacher_depth_hidden,
-                    depth_mask_tokens,
-                    self.distill_contrast_temperature,
+            student_image_hidden = self._project_image_distill(student_hidden[:, image_slice, :], layer_ordinal)
+            teacher_image_hidden = jax.lax.stop_gradient(image_hidden[:, teacher_slice(self.image_token_count), :])
+            image_losses.append(
+                self._cosine_distance_masked(
+                    student_image_hidden,
+                    teacher_image_hidden,
+                    image_mask_tokens,
                 )
             )
 
         future_flow_align_loss = jnp.mean(jnp.stack(flow_losses, axis=0), axis=0)
         future_depth_align_loss = jnp.mean(jnp.stack(depth_losses, axis=0), axis=0)
-        future_flow_contrast_loss = jnp.mean(jnp.stack(flow_contrast_losses, axis=0), axis=0)
-        future_depth_contrast_loss = jnp.mean(jnp.stack(depth_contrast_losses, axis=0), axis=0)
+        future_image_align_loss = jnp.mean(jnp.stack(image_losses, axis=0), axis=0)
         total_loss = (
             self.student_action_loss_weight * student_action_loss
             + self.flow_teacher_action_loss_weight * flow_teacher_action_loss
             + self.depth_teacher_action_loss_weight * depth_teacher_action_loss
+            + self.image_teacher_action_loss_weight * image_teacher_action_loss
             + self.future_flow_align_loss_weight * future_flow_align_loss
             + self.future_depth_align_loss_weight * future_depth_align_loss
-            + self.future_flow_contrast_loss_weight * future_flow_contrast_loss
-            + self.future_depth_contrast_loss_weight * future_depth_contrast_loss
+            + self.future_image_align_loss_weight * future_image_align_loss
         )
         stats = {
             "loss/student_action": student_action_loss,
             "loss/flow_teacher_action": flow_teacher_action_loss,
             "loss/depth_teacher_action": depth_teacher_action_loss,
+            "loss/image_teacher_action": image_teacher_action_loss,
             "loss/distill_future_flow": future_flow_align_loss,
             "loss/distill_future_depth": future_depth_align_loss,
-            "loss/contrast_future_flow": future_flow_contrast_loss,
-            "loss/contrast_future_depth": future_depth_contrast_loss,
+            "loss/distill_future_image": future_image_align_loss,
             "noise/student_future_query_token_rate": jnp.mean(noised_rate),
             "noise/student_future_query_scale": self._student_query_noise_scale(train_progress),
             "loss/total": total_loss,
@@ -638,10 +695,10 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm(
-            [prefix_tokens, None, None, None],
+            [prefix_tokens, None, None, None, None],
             mask=prefix_attn_mask,
             positions=prefix_positions,
-            adarms_cond=[None, None, None, None],
+            adarms_cond=[None, None, None, None, None],
         )
 
         def step(carry):
@@ -661,13 +718,13 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             full_attn_mask = jnp.concatenate([prefix_to_student, student_attn_mask], axis=-1)
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(student_mask, axis=-1) - 1
             outputs, _ = self.PaliGemma.llm(
-                [None, student_tokens, None, None],
+                [None, student_tokens, None, None, None],
                 mask=full_attn_mask,
                 positions=positions,
                 kv_cache=kv_cache,
-                adarms_cond=[None, student_adarms, None, None],
+                adarms_cond=[None, student_adarms, None, None, None],
             )
-            _, student_out, _, _ = outputs
+            _, student_out, _, _, _ = outputs
             v_t = self.action_out_proj_student(student_out[:, -self.action_horizon :])
             return x_t + dt * v_t, time + dt, step_rng
 

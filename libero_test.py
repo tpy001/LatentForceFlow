@@ -84,6 +84,7 @@ def eval_libero(args: Args) -> None:
 
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+        _set_camera_observables_enabled(env, False)
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -111,22 +112,26 @@ def eval_libero(args: Args) -> None:
                         t += 1
                         continue
 
-                    # Get preprocessed image
-                    # IMPORTANT: rotate 180 degrees to match train preprocessing
-                    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
-                    img = image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
-                    )
-                    wrist_img = image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
-                    )
-
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
-
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
+                        _set_camera_observables_enabled(env, True)
+                        obs = env.env._get_observations(force_update=True)
+                        _set_camera_observables_enabled(env, False)
+
+                        # Get preprocessed image
+                        # IMPORTANT: rotate 180 degrees to match train preprocessing
+                        img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                        wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                        img = image_tools.convert_to_uint8(
+                            image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
+                        )
+                        wrist_img = image_tools.convert_to_uint8(
+                            image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
+                        )
+
+                        # Save preprocessed image for replay video
+                        replay_images.append(img)
+
                         # Prepare observations dict
                         element = {
                             "observation/image": img,
@@ -195,6 +200,11 @@ def _get_libero_env(task, resolution, seed):
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
+
+
+def _set_camera_observables_enabled(env, enabled):
+    for obs_name in ("agentview_image", "robot0_eye_in_hand_image"):
+        env.env._observables[obs_name].set_enabled(enabled)
 
 
 def _quat2axisangle(quat):

@@ -271,14 +271,19 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     qformer_mlp_dim: int = 2048
     flow_teacher_expert_variant: _gemma.Variant = "gemma_300m"
     depth_teacher_expert_variant: _gemma.Variant = "gemma_300m"
+    image_teacher_expert_variant: _gemma.Variant = "gemma_300m"
     flow_teacher_action_loss_weight: float = 1.0
     depth_teacher_action_loss_weight: float = 1.0
+    image_teacher_action_loss_weight: float = 1.0
     future_depth_align_loss_weight: float = 0.1
+    future_image_align_loss_weight: float = 0.1
     future_flow_contrast_loss_weight: float = 0.0
     future_depth_contrast_loss_weight: float = 0.0
     distill_contrast_temperature: float = 0.1
     depth_token_count: int = 16
+    image_token_count: int = 16
     depth_distill_projector_hidden_dim: int | None = None
+    image_distill_projector_hidden_dim: int | None = None
 
     @override
     def __post_init__(self):
@@ -291,10 +296,17 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
             raise ValueError(f"flow_token_count must be positive, got {self.flow_token_count}.")
         if self.depth_token_count <= 0:
             raise ValueError(f"depth_token_count must be positive, got {self.depth_token_count}.")
+        if self.image_token_count <= 0:
+            raise ValueError(f"image_token_count must be positive, got {self.image_token_count}.")
         if self.future_depth_align_loss_weight < 0.0:
             raise ValueError(
                 "future_depth_align_loss_weight must be non-negative, "
                 f"got {self.future_depth_align_loss_weight}."
+            )
+        if self.future_image_align_loss_weight < 0.0:
+            raise ValueError(
+                "future_image_align_loss_weight must be non-negative, "
+                f"got {self.future_image_align_loss_weight}."
             )
         if self.future_flow_contrast_loss_weight < 0.0:
             raise ValueError(
@@ -311,6 +323,36 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
                 "distill_contrast_temperature must be positive, "
                 f"got {self.distill_contrast_temperature}."
             )
+
+    @override
+    def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model_tavla.Observation, _model_tavla.Actions]:
+        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+
+        with at.disable_typechecking():
+            observation_spec = _model_tavla.Observation(
+                images={
+                    "base_0_rgb": image_spec,
+                    "left_wrist_0_rgb": image_spec,
+                    "right_wrist_0_rgb": image_spec,
+                },
+                image_masks={
+                    "base_0_rgb": image_mask_spec,
+                    "left_wrist_0_rgb": image_mask_spec,
+                    "right_wrist_0_rgb": image_mask_spec,
+                },
+                state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                flow_img=image_spec,
+                wrist_flow_img=image_spec,
+                depth_img=image_spec,
+                wrist_depth_img=image_spec,
+                future_rgb_img=image_spec,
+                future_wrist_rgb_img=image_spec,
+                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+            )
+        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+        return observation_spec, action_spec
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0":
