@@ -91,7 +91,6 @@ def eval_libero(args: Args) -> None:
 
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
-        _set_camera_observables_enabled(env, False)
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -100,7 +99,7 @@ def eval_libero(args: Args) -> None:
 
             # Reset environment
             env.reset()
-            action_plan = collections.deque()
+            # action_plan = collections.deque()
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
@@ -119,11 +118,10 @@ def eval_libero(args: Args) -> None:
                         t += 1
                         continue
 
-                    if not action_plan:
+                    # if not action_plan:
+                    if True:
                         # Finished executing previous action chunk -- compute new chunk
-                        _set_camera_observables_enabled(env, True)
                         obs = env.env._get_observations(force_update=True)
-                        _set_camera_observables_enabled(env, False)
 
                         # Get preprocessed image
                         # IMPORTANT: rotate 180 degrees to match train preprocessing
@@ -247,11 +245,6 @@ def _sanitize_path_segment(value: str, *, max_length: int) -> str:
     if not sanitized:
         return "rollout"
     return sanitized[:max_length]
-
-
-def _set_camera_observables_enabled(env, enabled):
-    for obs_name in ("agentview_image", "robot0_eye_in_hand_image"):
-        env.env._observables[obs_name].set_enabled(enabled)
 
 
 def _create_policy_client(args: Args):
