@@ -473,6 +473,7 @@ class LeRobotTaVLADataConfig(DataConfigFactory):
 @dataclasses.dataclass(frozen=True)
 class LeRobotPiperDataConfig(DataConfigFactory):
     max_episodes: int | None = None
+    use_delta_joint_actions: bool = True
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -494,6 +495,12 @@ class LeRobotPiperDataConfig(DataConfigFactory):
             inputs=[yuanluo_policy.PiperInputs(model_type=model_config.model_type)],
             outputs=[yuanluo_policy.PiperOutputs()],
         )
+        if self.use_delta_joint_actions:
+            delta_action_mask = (True, True, True, True, True, True, False, True, True, True, True, True, True, False)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
         model_transforms = ModelTransformFactory()(model_config)
 
         return dataclasses.replace(
@@ -774,17 +781,10 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="llly/piper_gripper2",
+            repo_id="llly/piper_0616",
             base_config=DataConfig(prompt_from_task=True),
-            max_episodes=9,
         ),
         batch_size=8,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
-            peak_lr=5e-5,
-            decay_steps=15_000,
-            decay_lr=5e-6,
-        ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
@@ -794,7 +794,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=15_000,
+        num_train_steps=30_000,
         save_interval=5_000,
         keep_period=5_000,
         num_workers=4,
