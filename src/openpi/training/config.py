@@ -470,6 +470,43 @@ class LeRobotTaVLADataConfig(DataConfigFactory):
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotPiperDataConfig(DataConfigFactory):
+    max_episodes: int | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.front": "observation.images.front",
+                        "observation.images.side": "observation.images.side",
+                        "observation.images.third": "observation.images.third",
+                        "observation.state": "observation.state",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[yuanluo_policy.PiperInputs(model_type=model_config.model_type)],
+            outputs=[yuanluo_policy.PiperOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("observation.state",),
+            prompt_from_task=True,
+            max_episodes=self.max_episodes,
+        )
+
+
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotOptimalFlowDataConfig(DataConfigFactory):
@@ -726,6 +763,41 @@ _CONFIGS = [
         save_interval=10000,
         keep_period=10000,
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_piper_gripper2_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="llly/piper_gripper2",
+            base_config=DataConfig(prompt_from_task=True),
+            max_episodes=9,
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=15_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        num_workers=4,
     ),
     TrainConfig(
         name="pi0_latent_flow_depth_teachers_libero",

@@ -209,12 +209,11 @@ def create_torch_dataset(
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
 
-    delta_timestamps = {
-        **{
-            key: [t / dataset_meta.fps for t in range(model_config.action_horizon)]
-            for key in data_config.action_sequence_keys
-        }
-    } # 因为需要预测未来 action_horizon 步的 action，因此此处要设置 delta_timestamps，而不只是读取1帧
+    delta_timestamps = {}
+    for key in data_config.action_sequence_keys:
+        horizon = model_config.action_horizon + 1 if key == "observation.state" else model_config.action_horizon
+        delta_timestamps[key] = [t / dataset_meta.fps for t in range(horizon)]
+    # 因为需要预测未来 action_horizon 步的 action，因此此处要设置 delta_timestamps，而不只是读取1帧
     
     if "observation.effort" in dataset_meta.features:
         delta_timestamps["observation.effort"] = [t / dataset_meta.fps for t in data_config.effort_history] # 需要将过去 n 步 的 effort history 传入，注意，这里的 data_config.effort_history 必定是负的，例如,[-40,-36,-32...]
@@ -240,8 +239,10 @@ def create_torch_dataset(
             model_config.future_rgb_step / dataset_meta.fps,
         ]
 
+    episodes = list(range(data_config.max_episodes)) if data_config.max_episodes is not None else None
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        episodes=episodes,
         delta_timestamps=delta_timestamps
     )
 

@@ -170,3 +170,43 @@ class YuanluoTaVLAInputs(YuanluoInputs):
 @dataclasses.dataclass(frozen=True)
 class YuanluoTaVLAOutputs(YuanluoOutputs):
     pass
+
+
+@dataclasses.dataclass(frozen=True)
+class PiperInputs(transforms.DataTransformFn):
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        front_image = _parse_image(data["observation.images.front"])
+        side_image = _parse_image(data["observation.images.side"])
+        third_image = _parse_image(data["observation.images.third"])
+        state = np.asarray(data["observation.state"])
+
+        inputs = {
+            "state": state[0] if state.ndim > 1 else state,
+            "image": {
+                "base_0_rgb": front_image,
+                "left_wrist_0_rgb": side_image,
+                "right_wrist_0_rgb": third_image,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_,
+            },
+        }
+        if state.ndim > 1:
+            inputs["actions"] = state[1:]
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+        else:
+            raise ValueError("No task prompt found!")
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class PiperOutputs(transforms.DataTransformFn):
+    action_dim: int = 14
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}
