@@ -485,6 +485,7 @@ class LeRobotPiperDataConfig(DataConfigFactory):
                         "observation.images.side": "observation.images.side",
                         "observation.images.third": "observation.images.third",
                         "observation.state": "observation.state",
+                        "action": "action",
                         "prompt": "task",
                     }
                 )
@@ -508,7 +509,7 @@ class LeRobotPiperDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
-            action_sequence_keys=("observation.state",),
+            action_sequence_keys=("action",),
             prompt_from_task=True,
             max_episodes=self.max_episodes,
         )
@@ -781,7 +782,8 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="llly/piper_0616",
+            repo_id="llly/piper_0620_v21",
+            use_delta_joint_actions=False,
             base_config=DataConfig(prompt_from_task=True),
         ),
         batch_size=8,

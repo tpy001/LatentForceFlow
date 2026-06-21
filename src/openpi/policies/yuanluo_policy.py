@@ -195,8 +195,8 @@ class PiperInputs(transforms.DataTransformFn):
                 "right_wrist_0_rgb": np.True_,
             },
         }
-        if state.ndim > 1:
-            inputs["actions"] = state[1:]
+        if "action" in data:
+            inputs["actions"] = np.asarray(data["action"])
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
         else:
