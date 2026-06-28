@@ -782,7 +782,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="llly/piper_0621",
+            repo_id="llly/piper_0623",
             use_delta_joint_actions=True,
             base_config=DataConfig(prompt_from_task=True),
         ),
@@ -790,7 +790,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=16,
+            action_horizon=50,
             discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
@@ -799,6 +799,46 @@ _CONFIGS = [
         num_train_steps=30_000,
         save_interval=5_000,
         keep_period=5_000,
+        num_workers=4,
+    ),
+      TrainConfig(
+        name="pi05_piper_gripper2_full",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="llly/piper_0623",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi05_piper_gripper2_full_abs",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="llly/piper_0627",
+            use_delta_joint_actions=False,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
         num_workers=4,
     ),
      TrainConfig(
@@ -811,7 +851,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="llly/piper_0621",
+            repo_id="llly/piper_0623",
             use_delta_joint_actions=False,
             base_config=DataConfig(prompt_from_task=True),
         ),
