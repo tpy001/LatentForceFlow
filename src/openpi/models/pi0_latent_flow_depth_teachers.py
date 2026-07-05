@@ -48,7 +48,10 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         self.future_depth_align_loss_weight = float(config.future_depth_align_loss_weight)
         self.future_flow_contrast_loss_weight = float(config.future_flow_contrast_loss_weight)
         self.future_depth_contrast_loss_weight = float(config.future_depth_contrast_loss_weight)
+        self.future_flow_barlow_loss_weight = float(config.future_flow_barlow_loss_weight)
+        self.future_depth_barlow_loss_weight = float(config.future_depth_barlow_loss_weight)
         self.distill_contrast_temperature = float(config.distill_contrast_temperature)
+        self.distill_barlow_lambda = float(config.distill_barlow_lambda)
         self.flow_token_count = int(config.flow_token_count)
         self.depth_token_count = int(config.depth_token_count)
         self.future_visual_channels = 3
@@ -477,6 +480,33 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         denom = jnp.maximum(jnp.sum(weights, axis=-1), jnp.asarray(1.0, dtype=losses.dtype))
         return jnp.sum(losses * weights, axis=-1) / denom
 
+    @staticmethod
+    def _barlow_twins_loss(student, teacher, token_mask, lambd: float):
+        student = student.astype(jnp.float32)
+        teacher = teacher.astype(jnp.float32)
+        weights = token_mask.astype(jnp.float32)[..., None]
+
+        student_mean = jnp.sum(student * weights, axis=(0, 1), keepdims=True)
+        teacher_mean = jnp.sum(teacher * weights, axis=(0, 1), keepdims=True)
+        normalizer = jnp.maximum(jnp.sum(weights, axis=(0, 1), keepdims=True), 1.0)
+        student_mean = student_mean / normalizer
+        teacher_mean = teacher_mean / normalizer
+
+        student_centered = (student - student_mean) * weights
+        teacher_centered = (teacher - teacher_mean) * weights
+        student_std = jnp.sqrt(jnp.sum(jnp.square(student_centered), axis=(0, 1), keepdims=True) / normalizer + 1e-6)
+        teacher_std = jnp.sqrt(jnp.sum(jnp.square(teacher_centered), axis=(0, 1), keepdims=True) / normalizer + 1e-6)
+
+        student_norm = student_centered / student_std
+        teacher_norm = teacher_centered / teacher_std
+        cross_corr = jnp.einsum("btd,bte->de", student_norm, teacher_norm) / normalizer.reshape(())
+
+        diag = jnp.diag(cross_corr)
+        on_diag = jnp.mean(jnp.square(1.0 - diag))
+        off_diag_mask = 1.0 - jnp.eye(cross_corr.shape[0], dtype=jnp.float32)
+        off_diag = jnp.sum(jnp.square(cross_corr * off_diag_mask)) / jnp.maximum(jnp.sum(off_diag_mask), 1.0)
+        return on_diag + jnp.asarray(lambd, dtype=jnp.float32) * off_diag
+
     def _project_flow_distill(self, hidden, layer_ordinal: int):
         hidden = getattr(self, f"flow_distill_proj_in_{layer_ordinal}")(hidden)
         hidden = nnx.swish(hidden)
@@ -558,6 +588,8 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         depth_losses = []
         flow_contrast_losses = []
         depth_contrast_losses = []
+        flow_barlow_losses = []
+        depth_barlow_losses = []
         for layer_ordinal, layer in enumerate(layers):
             _, student_hidden, flow_hidden, depth_hidden = layer
             student_flow_hidden = self._project_flow_distill(student_hidden[:, flow_slice, :], layer_ordinal)
@@ -577,6 +609,14 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                     self.distill_contrast_temperature,
                 )
             )
+            flow_barlow_losses.append(
+                self._barlow_twins_loss(
+                    student_flow_hidden,
+                    teacher_flow_hidden,
+                    flow_mask_tokens,
+                    self.distill_barlow_lambda,
+                )
+            )
             student_depth_hidden = self._project_depth_distill(student_hidden[:, depth_slice, :], layer_ordinal)
             teacher_depth_hidden = jax.lax.stop_gradient(depth_hidden[:, teacher_slice(self.depth_token_count), :])
             depth_losses.append(
@@ -594,19 +634,27 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                     self.distill_contrast_temperature,
                 )
             )
+            depth_barlow_losses.append(
+                self._barlow_twins_loss(
+                    student_depth_hidden,
+                    teacher_depth_hidden,
+                    depth_mask_tokens,
+                    self.distill_barlow_lambda,
+                )
+            )
 
         future_flow_align_loss = jnp.mean(jnp.stack(flow_losses, axis=0), axis=0)
         future_depth_align_loss = jnp.mean(jnp.stack(depth_losses, axis=0), axis=0)
         future_flow_contrast_loss = jnp.mean(jnp.stack(flow_contrast_losses, axis=0), axis=0)
         future_depth_contrast_loss = jnp.mean(jnp.stack(depth_contrast_losses, axis=0), axis=0)
+        future_flow_barlow_loss = jnp.mean(jnp.stack(flow_barlow_losses, axis=0), axis=0)
+        future_depth_barlow_loss = jnp.mean(jnp.stack(depth_barlow_losses, axis=0), axis=0)
         total_loss = (
             self.student_action_loss_weight * student_action_loss
             + self.flow_teacher_action_loss_weight * flow_teacher_action_loss
             + self.depth_teacher_action_loss_weight * depth_teacher_action_loss
-            + self.future_flow_align_loss_weight * future_flow_align_loss
-            + self.future_depth_align_loss_weight * future_depth_align_loss
-            + self.future_flow_contrast_loss_weight * future_flow_contrast_loss
-            + self.future_depth_contrast_loss_weight * future_depth_contrast_loss
+            + self.future_flow_barlow_loss_weight * future_flow_barlow_loss
+            + self.future_depth_barlow_loss_weight * future_depth_barlow_loss
         )
         stats = {
             "loss/student_action": student_action_loss,
@@ -616,6 +664,8 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             "loss/distill_future_depth": future_depth_align_loss,
             "loss/contrast_future_flow": future_flow_contrast_loss,
             "loss/contrast_future_depth": future_depth_contrast_loss,
+            "loss/barlow_future_flow": future_flow_barlow_loss,
+            "loss/barlow_future_depth": future_depth_barlow_loss,
             "noise/student_future_query_token_rate": jnp.mean(noised_rate),
             "noise/student_future_query_scale": self._student_query_noise_scale(train_progress),
             "loss/total": total_loss,

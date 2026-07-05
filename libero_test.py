@@ -13,6 +13,7 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
+import websockets.exceptions
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -44,6 +45,17 @@ class Args:
     video_out_path: str = "data/libero/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
+
+
+def _is_server_disconnect_error(exc: Exception) -> bool:
+    return isinstance(
+        exc,
+        (
+            BrokenPipeError,
+            ConnectionError,
+            websockets.exceptions.WebSocketException,
+        ),
+    )
 
 
 def eval_libero(args: Args) -> None:
@@ -100,6 +112,7 @@ def eval_libero(args: Args) -> None:
             # Setup
             t = 0
             replay_images = []
+            done = False
 
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
@@ -159,6 +172,14 @@ def eval_libero(args: Args) -> None:
                     t += 1
 
                 except Exception as e:
+                    if _is_server_disconnect_error(e):
+                        if replay_images:
+                            replay_images.pop()
+                        action_plan.clear()
+                        logging.warning(f"Inference server disconnected: {e}")
+                        client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+                        logging.info("Inference server reconnected. Resuming current episode.")
+                        continue
                     logging.error(f"Caught exception: {e}")
                     break
 

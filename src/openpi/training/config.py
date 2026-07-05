@@ -19,6 +19,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.yuanluo_policy as yuanluo_policy
+import openpi.policies.isaaclab_policy as isaaclab_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
@@ -472,6 +473,65 @@ class LeRobotTaVLADataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotRobotwinDataConfig(DataConfigFactory):
+    """Data config for the Robotwin clean dataset."""
+
+    max_episodes: int | None = None
+    rcs_sample_enable: bool = False
+    default_prompt: str | None = None
+    extra_delta_transform: bool = False
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.front": "observation.images.cam_high",
+                        "observation.images.left_wrist": "observation.images.cam_left_wrist",
+                        "observation.images.right_wrist": "observation.images.cam_right_wrist",
+                        "observation.state": "observation.state",
+                        "action": "action",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                isaaclab_policy.IsaacLabInputs(
+                    model_type=model_config.model_type,
+                    state_dim=14,
+                    use_right_wrist_image=True,
+                )
+            ],
+            outputs=[isaaclab_policy.IsaacLabOutputs(action_dim=14)],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+            prompt_from_task=(self.default_prompt is None),
+            max_episodes=self.max_episodes,
+            rcs_sample_enable=self.rcs_sample_enable,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotOptimalFlowDataConfig(DataConfigFactory):
     """
     Data config for the custom Yuanluo dataset.
@@ -722,6 +782,30 @@ _CONFIGS = [
         ),
         batch_size=32,
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        save_interval=10000,
+        keep_period=10000,
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_robotwin_clean",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            discrete_state_input=False,
+        ),
+        data=LeRobotRobotwinDataConfig(
+            repo_id="llly/robotwin_clean_randomized_224",
+            # repo_id="llly/robotwin_clean",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        num_workers=4,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         save_interval=10000,
         keep_period=10000,
@@ -768,14 +852,17 @@ _CONFIGS = [
             effort_type=EffortType.NO,
             effort_dim=None,
             future_force_align_loss_weight=0.0,
-            future_flow_align_loss_weight=1.0,
-            future_depth_align_loss_weight=1.0,
-            future_flow_contrast_loss_weight=0.01,
-            future_depth_contrast_loss_weight=0.01,
+            future_flow_align_loss_weight=0.0,
+            future_depth_align_loss_weight=0.0,
+            future_flow_contrast_loss_weight=0.,
+            future_depth_contrast_loss_weight=0.,
+            future_flow_barlow_loss_weight=1.0,
+            future_depth_barlow_loss_weight=1.0,
+            distill_barlow_lambda=0.5,
             distill_contrast_temperature=0.1,
             flow_token_count=16,
             depth_token_count=16,
-            student_future_query_noise_scale_max=0.3,
+            student_future_query_noise_scale_max=0.,
             student_future_query_noise_start_ratio=0.3,
             student_future_query_noise_end_ratio=0.7,
             use_future_rgb_instead_of_flow=False,
@@ -787,7 +874,8 @@ _CONFIGS = [
             ),
             extra_delta_transform=False,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         num_train_steps=30_000,
         save_interval=10000,
